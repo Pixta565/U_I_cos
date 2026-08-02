@@ -20,6 +20,7 @@ import queue
 import numpy as np
 from numpy.fft import rfft, rfftfreq
 from datetime import datetime
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Графика
 try:
@@ -368,16 +369,54 @@ class HarmonicsApp:
         self.check_queue()
 
     def setup_ui(self):
-        main_panel = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_panel.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Главный вертикальный PanedWindow: верх (статус+управление) и низ (логи)
+        main_vert = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        main_vert.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        left_frame = ttk.Frame(main_panel, width=400)
-        right_frame = ttk.Frame(main_panel, width=800)
-        main_panel.add(left_frame, weight=0)
-        main_panel.add(right_frame, weight=1)
+        # Верхняя часть: горизонтальный PanedWindow (статус слева, управление справа)
+        top_horiz = ttk.PanedWindow(main_vert, orient=tk.HORIZONTAL)
+        main_vert.add(top_horiz, weight=1)
 
-        self.build_control_panel(left_frame)
-        self.build_output_panel(right_frame)
+        # Левая панель (статус)
+        left_frame = ttk.Frame(top_horiz)
+        top_horiz.add(left_frame, weight=0)
+        self.status_frame = ttk.LabelFrame(left_frame, text="Статус", padding=5)
+        self.status_frame.pack(fill=tk.BOTH, expand=True)
+        self.status_label = ttk.Label(self.status_frame, text="Готов к работе", font=('Arial', 11))
+        self.status_label.pack(anchor=tk.W, pady=2)
+        self.progress_detail = ttk.Label(self.status_frame, text="", font=('Arial', 9))
+        self.progress_detail.pack(anchor=tk.W)
+
+        # Правая панель (управление)
+        right_frame = ttk.Frame(top_horiz)
+        top_horiz.add(right_frame, weight=1)
+        self.build_control_panel(right_frame)
+
+        # Нижняя часть: логи (фиксированная высота около 100 пикселей)
+        log_frame = ttk.LabelFrame(main_vert, text="Логи", padding=5)
+        main_vert.add(log_frame, weight=0)
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=4, wrap=tk.WORD)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        # Отложенная установка позиций разделителей
+        def set_sashes():
+            # Устанавливаем ширину левой панели (250 пикс)
+            if top_horiz.winfo_exists():
+                top_horiz.sashpos(0, 250)
+            # Устанавливаем высоту логов (100 пикс от нижнего края)
+            if main_vert.winfo_exists():
+                h = main_vert.winfo_height()
+                if h > 200:
+                    main_vert.sashpos(0, h - 400)
+
+        self.root.after(300, set_sashes)
+
+        # Отложенная установка позиции разделителя, чтобы высота логов была ~100 пикселей
+        def set_sash():
+            h = main_vert.winfo_height()
+            if h > 200:
+                main_vert.sashpos(0, h - 400)
+        self.root.after(200, set_sash)
 
     def build_control_panel(self, parent):
         ttk.Label(parent, text="Параметры анализа", font=('Arial', 11, 'bold')).pack(anchor=tk.W, pady=5)
@@ -425,25 +464,13 @@ class HarmonicsApp:
 
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=10)
+        ttk.Button(btn_frame, text="Предпросмотр", command=self.preview_signal).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Настройки", command=self.open_settings).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Запуск", style='Start.TButton', command=self.start_analysis).pack(side=tk.RIGHT, padx=2)
 
         self.progress = ttk.Progressbar(parent, mode='determinate', maximum=100)
         self.progress.pack(fill=tk.X, pady=5)
 
-    def build_output_panel(self, parent):
-        # Вместо графиков – информационная панель
-        info_frame = ttk.LabelFrame(parent, text="Информация", padding=5)
-        info_frame.pack(fill=tk.BOTH, expand=False, pady=5)
-        self.info_label = ttk.Label(info_frame, text="Отчёты формируются в фоновом режиме\n"
-                                                    "Пожалуйста, подождите...", font=('Arial', 12))
-        self.info_label.pack(expand=True, pady=10)
-
-        # Логи
-        log_frame = ttk.LabelFrame(parent, text="Логи / отчёт", padding=5)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
 
     def update_file_visibility(self):
         mode = self.mode_var.get()
@@ -547,6 +574,72 @@ class HarmonicsApp:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
+
+    def preview_signal(self):
+        """Показывает первые 10 периодов сигналов выбранных каналов."""
+        path = self.csv_file_paths[0].get()
+        if not path:
+            messagebox.showerror("Ошибка", "Сначала выберите CSV-файл.")
+            return
+        assignments = [var.get() for var in self.channel_vars]
+        if not assignments:
+            messagebox.showerror("Ошибка", "Сначала назначьте каналы (загрузите файл и укажите назначение).")
+            return
+
+        try:
+            t0, tInc, ch_names, data = parse_csv(path)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать CSV: {e}")
+            return
+
+        signals = []
+        labels = []
+        for i, assign in enumerate(assignments):
+            if i >= data.shape[1]:
+                continue
+            signal = data[:, i]
+            if assign == "Напряжение":
+                signal = signal * self.settings['scale_voltage']
+                labels.append(f"{ch_names[i]} (U)")
+            elif assign == "Ток":
+                signal = signal * self.settings['scale_current']
+                labels.append(f"{ch_names[i]} (I)")
+            else:
+                continue
+            signals.append((signal, labels[-1]))
+
+        if not signals:
+            messagebox.showinfo("Информация", "Нет выбранных каналов для предпросмотра.")
+            return
+
+        # Оценка частоты по первому сигналу
+        f0 = estimate_frequency(signals[0][0], tInc)
+        T = 1.0 / f0
+        Np = int(round(T / tInc))
+        max_periods = 10
+        N_show = min(len(signals[0][0]), max_periods * Np)
+
+        # Построение графика в новом окне
+        fig = Figure(figsize=(10, 5), dpi=100)
+        ax = fig.add_subplot(111)
+        t = np.arange(N_show) * tInc
+        for sig, label in signals:
+            ax.plot(t, sig[:N_show], label=label)
+        ax.set_xlabel("Время, с")
+        ax.set_ylabel("Значение")
+        ax.set_title(f"Предпросмотр сигналов (первые {max_periods} периодов)")
+        ax.legend()
+        ax.grid(True)
+
+        # Создаём модальное окно
+        preview_win = tk.Toplevel(self.root)
+        preview_win.title("Предпросмотр сигнала")
+        canvas = FigureCanvasTkAgg(fig, master=preview_win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        preview_win.transient(self.root)
+        preview_win.grab_set()
+        preview_win.focus_set()
 
     def start_analysis(self):
         self.progress['mode'] = 'determinate'
@@ -2867,7 +2960,6 @@ class HarmonicsApp:
 
     # ========== ГРАФИКИ ДЛЯ РЕЖИМА «НАПРЯЖЕНИЕ + ТОК» ==========
     def generate_extended_combined_plots(self, data):
-        # 8 графиков
         total_plots = 8
         current_plot = 0
 
@@ -2930,7 +3022,7 @@ class HarmonicsApp:
                 ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01,
                         f'{pf:.2f}', ha='center', va='bottom', fontsize=7)
         self._save_figure(fig, "power_factor_harmonics.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_power_pie(self, data):
         fig = Figure(figsize=(10, 10), dpi=300)
@@ -2946,7 +3038,7 @@ class HarmonicsApp:
             ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
             ax.set_title("Составляющие полной мощности")
         self._save_figure(fig, "power_pie.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_ui_relative_amplitudes(self, data):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -2975,7 +3067,7 @@ class HarmonicsApp:
                     ax.text(bar.get_x() + bar.get_width()/2., h + 0.1,
                             f'{h:.1f}', ha='center', va='bottom', fontsize=6)
         self._save_figure(fig, "U_I_relative_amplitudes.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_ui_signal(self, data):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -2989,7 +3081,7 @@ class HarmonicsApp:
         ax.legend()
         ax.grid(True)
         self._save_figure(fig, "U_I_signal.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_spectrum(self, signal, tInc, filename, title):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3010,7 +3102,7 @@ class HarmonicsApp:
         ax.set_title(title)
         ax.grid(True)
         self._save_figure(fig, filename)
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_vector_diagram(self, data):
         fig = Figure(figsize=(8, 8), dpi=300)
@@ -3041,7 +3133,7 @@ class HarmonicsApp:
             ax.text(0.5, 0.5, "Нет данных", transform=ax.transAxes, ha='center')
             ax.axis('off')
         self._save_figure(fig, "Векторная_диаграмма.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_combined_ui_overview(self, data):
         fig = Figure(figsize=(20, 12), dpi=300)
@@ -3114,59 +3206,61 @@ class HarmonicsApp:
         fig.delaxes(axs[1, 2])
         fig.tight_layout()
         self._save_figure(fig, "combined_U_I_overview.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     # ========== ГРАФИКИ (фото) ==========
     def generate_extended_voltage_plots(self, data):
         phases = data['phases']
         long_analysis = data['long_analysis']
 
-         # Определяем общее количество графиков
-        # (каждый вызов _save_figure – это 1 график)
-        plot_count = 1  # сравнение относительных амплитуд
-        plot_count += len(phases)  # RMS для каждой фазы
-        plot_count += len(phases)  # Гармоники 1-40 с ГОСТ
-        plot_count += len(phases)  # Гармоники 2-40 с ГОСТ
-        plot_count += len(phases)  # Амплитудный спектр
-        plot_count += len(phases)  # Сигнал
-        plot_count += len(phases)  # Общий анализ
-        total_plots = plot_count
+        # Подсчитываем общее количество графиков
+        total_plots = 1                     # сравнение относительных амплитуд
+        total_plots += len(phases)          # RMS для каждой фазы
+        total_plots += len(phases)          # Гармоники 1-40 с ГОСТ
+        total_plots += len(phases)          # Гармоники 2-40 с ГОСТ
+        total_plots += len(phases)          # Амплитудный спектр
+        total_plots += len(phases)          # Сигнал
+        total_plots += len(phases)          # Общий анализ
         current_plot = 0
 
-        # Для каждой фазы строим множество графиков
-        phase_names = [ph['name'] for ph in phases]
         # 1. Сравнение относительных амплитуд гармоник по фазам
         self._plot_relative_harmonics_comparison(phases)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        # 2. RMS по периодам для каждой фазы 
+
+        # 2. RMS по периодам для каждой фазы
         for ph in phases:
             self._plot_rms_periods(ph)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        # 3. Гармоники 1-40 с пределами ГОСТ для каждой фазы
+
+        # 3. Гармоники 1-40 с ГОСТ для каждой фазы
         for ph in phases:
             self._plot_harmonics_with_gost(ph, start_harm=1, end_harm=40)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        # 4. Гармоники 2-40 с пределами ГОСТ для каждой фазы
+
+        # 4. Гармоники 2-40 с ГОСТ для каждой фазы
         for ph in phases:
             self._plot_harmonics_with_gost(ph, start_harm=2, end_harm=40)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        # 5. Амплитудный спектр (без чисел)
+
+        # 5. Амплитудный спектр для каждой фазы
         for ph in phases:
-            self._plot_spectrum(ph['signal'], ph['tInc'], 
-                        f"Амплитудный_спектр_фаза_{ph['name']}.png", 
-                        f"Амплитудный спектр фазы {ph['name']}")
+            self._plot_spectrum(ph['signal'], ph['tInc'],
+                                f"Амплитудный_спектр_фаза_{ph['name']}.png",
+                                f"Амплитудный спектр фазы {ph['name']}")
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        # 6. Сигнал (временная диаграмма)
+
+        # 6. Сигнал для каждой фазы
         for ph in phases:
             self._plot_signal(ph)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        # 7. Общий анализ гармоник фазы (5 subplots)
+
+        # 7. Общий анализ для каждой фазы
         for ph in phases:
             self._plot_combined_analysis(ph)
             current_plot += 1
@@ -3198,7 +3292,7 @@ class HarmonicsApp:
         # Немного увеличим верхнюю границу, чтобы подписи не обрезались
         ax.set_ylim(0, max_rel * 1.15 if max_rel > 0 else 10)
         self._save_figure(fig, "Сравнение_отн_амплитуд_гармоник.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_rms_periods(self, ph):
         long_analysis = self.long_analysis_var.get()
@@ -3233,7 +3327,7 @@ class HarmonicsApp:
         ax.grid(True)
         ax.legend()
         self._save_figure(fig, f"RMS_периоды_фаза_{ph['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_harmonics_with_gost(self, ph, start_harm=1, end_harm=40):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3261,7 +3355,7 @@ class HarmonicsApp:
         ax.legend()
         ax.grid(True)
         self._save_figure(fig, f"Гармоники_{start_harm}-{end_harm}_ГОСТ_фаза_{ph['name']}.png") 
-        self.result_queue.put(("progress", i / total_plots * 100))
+       
         
     def _plot_spectrum(self, ph):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3285,7 +3379,7 @@ class HarmonicsApp:
         ax.grid(True)
         # без чисел над столбиками
         self._save_figure(fig, f"Амплитудный_спектр_фаза_{ph['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_signal(self, ph):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3297,7 +3391,7 @@ class HarmonicsApp:
         ax.set_title(f"Сигнал - Фаза {ph['name']}")
         ax.grid(True)
         self._save_figure(fig, f"Сигнал_фаза_{ph['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_combined_analysis(self, ph):
         fig = Figure(figsize=(20, 12), dpi=300)
@@ -3368,7 +3462,7 @@ class HarmonicsApp:
 
         fig.tight_layout()
         self._save_figure(fig, f"Общий_анализ_фаза_{ph['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _draw_harmonics_gost_on_ax(self, ax, ph, start, end):
         U1 = ph['stats']['Urms']
@@ -3390,9 +3484,7 @@ class HarmonicsApp:
     def generate_extended_current_plots(self, data):
         channels = data['channels']
         long_analysis = data['long_analysis']
-
-        # На каждый канал: 7 графиков
-        total_plots = len(channels) * 7
+        total_plots = len(channels) * 7   # 7 графиков на каждый канал
         current_plot = 0
 
         for ch in channels:
@@ -3453,7 +3545,7 @@ class HarmonicsApp:
         ax.set_title(f"RMS тока по периодам - {ch['name']}")
         ax.grid(True)
         self._save_figure(fig, f"RMS_тока_периоды_{ch['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_current_signal(self, ch):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3465,7 +3557,7 @@ class HarmonicsApp:
         ax.set_title(f"Исходный сигнал тока (DC удалён) - {ch['name']}")
         ax.grid(True)
         self._save_figure(fig, f"Сигнал_тока_{ch['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_current_harmonics(self, ch, start, end):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3488,7 +3580,7 @@ class HarmonicsApp:
             if h > 0:
                 ax.text(bar.get_x() + bar.get_width() / 2., h, f'{h:.2f}', ha='center', va='bottom', fontsize=7)
         self._save_figure(fig, f"Гармоники_тока_{start}-{end}_{ch['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_current_thdi_pie(self, ch):
         fig = Figure(figsize=(12, 10), dpi=300)
@@ -3520,7 +3612,7 @@ class HarmonicsApp:
                 ax.text(x, y, label, ha='center', va='center', fontsize=9)
             ax.set_title(f"Вклад гармоник в THDi - {ch['name']}")
         self._save_figure(fig, f"THDi_диаграмма_{ch['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_current_spectrum(self, ch):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3542,7 +3634,7 @@ class HarmonicsApp:
         ax.set_title(f"Амплитудный спектр тока - {ch['name']}")
         ax.grid(True)
         self._save_figure(fig, f"Спектр_тока_{ch['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_current_combined(self, ch):
         fig = Figure(figsize=(20, 12), dpi=300)
@@ -3611,10 +3703,9 @@ class HarmonicsApp:
 
         fig.tight_layout()
         self._save_figure(fig, f"Общий_анализ_тока_{ch['name']}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def generate_extended_combined_plots(self, data):
-        # 8 графиков
         total_plots = 8
         current_plot = 0
 
@@ -3672,7 +3763,7 @@ class HarmonicsApp:
         ax.set_title("Коэффициент мощности по гармоникам")
         ax.grid(True)
         self._save_figure(fig, "Коэффициент_мощности_по_гармоникам.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_power_pie(self, data):
         fig = Figure(figsize=(10, 10), dpi=300)
@@ -3696,7 +3787,7 @@ class HarmonicsApp:
             ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=12,
                     verticalalignment='top', bbox=props)
         self._save_figure(fig, "Круговая_диаграмма_мощности.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_ui_relative_amplitudes(self, data):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3718,7 +3809,7 @@ class HarmonicsApp:
         ax.legend()
         ax.grid(True)
         self._save_figure(fig, "Относительные_амплитуды_U_I.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_ui_signal(self, data):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3732,7 +3823,7 @@ class HarmonicsApp:
         ax.legend()
         ax.grid(True)
         self._save_figure(fig, "Сигнал_напряжения_и_тока.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_spectrum(self, signal, tInc, filename, title):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3753,7 +3844,7 @@ class HarmonicsApp:
         ax.set_title(title)
         ax.grid(True)
         self._save_figure(fig, filename)
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_vector_diagram(self, data):
         fig = Figure(figsize=(8, 8), dpi=300)
@@ -3780,7 +3871,7 @@ class HarmonicsApp:
             ax.text(0.5, 0.5, "Нет данных", transform=ax.transAxes, ha='center')
             ax.axis('off')
         self._save_figure(fig, "Векторная_диаграмма.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_combined_ui_overview(self, data):
         fig = Figure(figsize=(20, 12), dpi=300)
@@ -3854,24 +3945,12 @@ class HarmonicsApp:
         fig.delaxes(axs[1,2])
         fig.tight_layout()
         self._save_figure(fig, "Общий_анализ_напряжения_и_тока.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     # ========== ГРАФИКИ ДЛЯ ТРЁХФАЗНОГО ОБЪЕДИНЁННОГО РЕЖИМА ==========
     def generate_extended_three_phase_plots(self, data):
         phases = data['phases']
-
-        # Считаем общее количество графиков:
-        # 1. Коэффициент мощности по гармоникам для каждой фазы: 3
-        # 2. Общий коэффициент мощности: 1
-        # 3. Круговые диаграммы мощности для каждой фазы: 3
-        # 4. Общая круговая диаграмма мощности: 1
-        # 5. Относительные амплитуды U и I (все фазы на одном): 1
-        # 6. Напряжение и ток каждой фазы: 3
-        # 7. Спектры U и I для каждой фазы: 3 * 2 = 6
-        # 8. Общая векторная диаграмма: 1
-        # 9. Общий анализ для каждой фазы: 3
-        # 10. Общий анализ всех трёх фаз: 1
-        total_plots = 3 + 1 + 3 + 1 + 1 + 3 + 6 + 1 + 3 + 1
+        total_plots = 23
         current_plot = 0
 
         # 1. Коэффициент мощности по гармоникам для каждой фазы
@@ -3901,13 +3980,13 @@ class HarmonicsApp:
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-        # 6. Напряжение и ток каждой фазы
+        # 6. Напряжение и ток каждой фазы (синусоиды)
         for ph in phases:
             self._plot_phase_voltage_current(ph, f"фаза_{ph['name']}")
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-        # 7. Спектры U и I для каждой фазы
+        # 7. Спектры U и I для каждой фазы (без 1-й гармоники)
         for ph in phases:
             self._plot_phase_spectrum(ph['voltage']['signal'], ph['voltage']['tInc'],
                                     f"Спектр_U_фаза_{ph['name']}.png",
@@ -3921,18 +4000,18 @@ class HarmonicsApp:
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-        # 8. Общая векторная диаграмма
+        # 8. Общая векторная диаграмма (три фазы на одном рисунке)
         self._plot_three_phase_vector(phases)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-        # 9. Общий анализ для каждой фазы
+        # 9. Общий анализ для каждой фазы (5 фото на одном)
         for ph in phases:
             self._plot_phase_combined(ph, f"фаза_{ph['name']}")
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-        # 10. Общий анализ всех трёх фаз
+        # 10. Общий анализ всех трёх фаз (5 графиков на одном фото)
         self._plot_three_phase_total_combined(phases)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
@@ -3959,7 +4038,7 @@ class HarmonicsApp:
         ax.set_title(f"Коэффициент мощности по гармоникам ({suffix})")
         ax.grid(True)
         self._save_figure(fig, f"Коэффициент_мощности_по_гармоникам_{suffix}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_total_power_factor(self, phases):
         """Общий коэффициент мощности по гармоникам (усреднённый по трём фазам)."""
@@ -3984,7 +4063,7 @@ class HarmonicsApp:
         ax.set_title("Общий коэффициент мощности по гармоникам (среднее по фазам)")
         ax.grid(True)
         self._save_figure(fig, "Общий_коэффициент_мощности_по_гармоникам.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_phase_power_pie(self, ph, suffix):
         """Круговая диаграмма мощности для одной фазы."""
@@ -4007,7 +4086,7 @@ class HarmonicsApp:
             ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=12,
                     verticalalignment='top', bbox=props)
         self._save_figure(fig, f"Круговая_диаграмма_мощности_{suffix}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_total_power_pie(self, data):
         """Общая круговая диаграмма суммарной мощности."""
@@ -4031,7 +4110,7 @@ class HarmonicsApp:
             ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=12,
                     verticalalignment='top', bbox=props)
         self._save_figure(fig, "Общая_круговая_диаграмма_мощности.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_three_phase_relative_amplitudes(self, phases):
         """Относительные амплитуды U и I (без 1-й гармоники) – все фазы вместе."""
@@ -4058,7 +4137,7 @@ class HarmonicsApp:
         ax.legend(loc='upper right', fontsize='small')
         ax.grid(True)
         self._save_figure(fig, "Относительные_амплитуды_U_I.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_phase_voltage_current(self, ph, suffix):
         """Напряжение и ток одной фазы на одном графике."""
@@ -4073,7 +4152,7 @@ class HarmonicsApp:
         ax.legend()
         ax.grid(True)
         self._save_figure(fig, f"Напряжение_и_ток_{suffix}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_phase_spectrum(self, signal, tInc, filename, title):
         """Спектр сигнала без первой гармоники."""
@@ -4095,7 +4174,7 @@ class HarmonicsApp:
         ax.set_title(title)
         ax.grid(True)
         self._save_figure(fig, filename)
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_three_phase_vector(self, phases):
         """Общая векторная диаграмма трёх фаз (нормированные стрелки)."""
@@ -4125,7 +4204,7 @@ class HarmonicsApp:
         ax.legend(loc='upper right', fontsize='small')
         ax.grid(True)
         self._save_figure(fig, "Векторная_диаграмма_трёхфазная.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _plot_phase_combined(self, ph, suffix):
         """Общий анализ для одной фазы: 5 графиков на одном фото."""
@@ -4176,7 +4255,7 @@ class HarmonicsApp:
         fig.delaxes(fig.add_subplot(gs[1, 2]))
         fig.tight_layout()
         self._save_figure(fig, f"Общий_анализ_{suffix}.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _mini_spectrum(self, ax, signal, tInc, title):
         """Вспомогательный метод для отрисовки мини-спектра."""
@@ -4251,7 +4330,7 @@ class HarmonicsApp:
         fig.delaxes(fig.add_subplot(gs[1, 2]))
         fig.tight_layout()
         self._save_figure(fig, "Общий_анализ_всех_фаз.png")
-        self.result_queue.put(("progress", i / total_plots * 100))
+        
 
     def _mini_three_phase_vector(self, ax, phases):
         colors = ['red', 'green', 'blue']
