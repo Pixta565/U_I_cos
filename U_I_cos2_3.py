@@ -44,6 +44,7 @@ except ImportError:
 # Excel
 try:
     import openpyxl
+    from openpyxl.chart import BarChart, LineChart, Reference
     from openpyxl.styles import Font, Alignment, Border, Side
     from openpyxl.chart import BarChart, Reference
     from openpyxl.utils import get_column_letter
@@ -559,7 +560,9 @@ class HarmonicsApp:
     def run_analysis(self, mode, paths):
         try:
             if "Трёхфазный" in mode:
-                self.analyze_three_phase(paths)
+                # Извлекаем tInc из первого файла
+                _, tInc, _, _ = parse_csv(paths[0])
+                self.analyze_three_phase_extended(paths, tInc)
             else:
                 self.analyze_single(mode, paths[0])
         except Exception as e:
@@ -589,20 +592,14 @@ class HarmonicsApp:
             if not current_signals:
                 raise ValueError("Не выбраны каналы тока")
             self.analyze_current_only(current_signals, tInc)
-            results = {}
-            for idx, sig in enumerate(current_signals):
-                res = self.process_signal(sig, tInc, 'current')
-                results[f"I{idx+1}"] = res
-            self.result_queue.put(("current_results", results))
         elif mode == "Напряжение и ток (одна фаза)":
             if len(voltage_signals) != 1 or len(current_signals) != 1:
                 raise ValueError("Назначьте ровно одно напряжение и один ток")
             self.analyze_voltage_current(voltage_signals[0], current_signals[0], tInc)
-        elif "Трёхфазный" in mode:
-            self.analyze_three_phase_extended(paths, tInc)
         else:
             raise ValueError("Некорректная конфигурация каналов для выбранного режима")
 
+        
     def analyze_voltage_only(self, voltage_signals, tInc, ch_names, assignments):
         """
         Расширенный анализ напряжения с детальными параметрами и таблицами.
@@ -894,6 +891,35 @@ class HarmonicsApp:
             'long_analysis': long_analysis,
             'tInc': tInc
         }))
+
+    def check_queue(self):
+            try:
+                while True:
+                    msg = self.result_queue.get_nowait()
+                    if msg[0] == "log":
+                        self.log(msg[1])
+                    elif msg[0] == "error":
+                        self.log(f"ОШИБКА: {msg[1]}")
+                        messagebox.showerror("Ошибка", msg[1])
+                        self.progress.stop()
+                    elif msg[0] == "done":
+                        self.progress.stop()
+                        self.log("Анализ завершён.")
+                    elif msg[0] == "voltage_results_extended":
+                        self.handle_extended_voltage_results(msg[1])
+                    elif msg[0] == "combined_results":
+                        self.display_combined_results(msg[1])
+                    elif msg[0] == "three_phase_results":
+                        self.display_three_phase_results(msg[1])
+                    elif msg[0] == "current_results_extended":
+                        self.handle_extended_current_results(msg[1])
+                    elif msg[0] == "combined_results_extended":
+                        self.handle_extended_combined_results(msg[1])
+                    elif msg[0] == "three_phase_extended":
+                        self.handle_extended_three_phase_results(msg[1])
+            except queue.Empty:
+                pass
+            self.root.after(100, self.check_queue)
 
     # -------------------- Обработчики расширенного отчёта по напряжению --------------------
     def handle_extended_voltage_results(self, data):
@@ -3921,10 +3947,10 @@ class HarmonicsApp:
         ax.grid(True)
 
     def _plot_three_phase_total_combined(self, phases):
-        """Общий анализ всех трёх фаз: 5 графиков на одном фото."""
         fig = Figure(figsize=(24, 14), dpi=300)
         gs = fig.add_gridspec(2, 3)
-        # 1. Сравнение напряжений трёх фаз (или суммарная мощность)
+        
+        # 1. Напряжения трёх фаз
         ax1 = fig.add_subplot(gs[0, 0])
         t = np.arange(len(phases[0]['voltage']['signal'])) * phases[0]['voltage']['tInc']
         for ph in phases:
@@ -3932,7 +3958,7 @@ class HarmonicsApp:
         ax1.set_title("Напряжения трёх фаз")
         ax1.legend(); ax1.grid(True)
 
-        # 2. Общий коэффициент мощности по гармоникам (средний)
+        # 2. Средний коэффициент мощности по гармоникам
         ax2 = fig.add_subplot(gs[0, 1])
         h_list = range(1, 41)
         pfs_avg = []
@@ -3940,7 +3966,8 @@ class HarmonicsApp:
             pf_sum = 0; count = 0
             for ph in phases:
                 if h in ph['power']['P_harm']:
-                    P = ph['power']['P_harm'][h]; Q = ph['power']['Q_harm'][h]
+                    P = ph['power']['P_harm'][h]
+                    Q = ph['power']['Q_harm'][h]
                     S = np.sqrt(P**2+Q**2)
                     pf_sum += P/S if S else 0
                     count += 1
@@ -3949,30 +3976,32 @@ class HarmonicsApp:
         ax2.set_title("Средний коэффициент мощности")
         ax2.grid(True)
 
-        # 3. Общая круговая диаграмма суммарной мощности
+        # 3. Суммарная круговая диаграмма мощности
         ax3 = fig.add_subplot(gs[0, 2])
-        total = data['total_power'] if 'total_power' in data else None
-        # data не видна, но можно использовать суммарную мощность из фаз
-        # но здесь у нас нет data, используем суммарную мощность из фаз
-        P_total = sum(ph['power']['P_total'] for ph in phases)
-        Q_total = sum(ph['power']['Q_total'] for ph in phases)
+        P_total = sum(abs(ph['power']['P_total']) for ph in phases)
+        Q_total = sum(abs(ph['power']['Q_total']) for ph in phases)
         S_total = np.sqrt(P_total**2 + Q_total**2)
+        pf_total = P_total / S_total if S_total else 0
         if P_total == 0 and Q_total == 0:
             ax3.text(0.5, 0.5, "S=0", transform=ax3.transAxes, ha='center')
             ax3.axis('off')
         else:
-            ax3.pie([abs(P_total), abs(Q_total)], labels=['P', 'Q'], autopct='%1.1f%%')
+            ax3.pie([P_total, Q_total], labels=['P', 'Q'], autopct='%1.1f%%')
+            textstr = f'P = {P_total:.2f} Вт\nQ = {Q_total:.2f} вар\nS = {S_total:.2f} ВА\ncos φ = {pf_total:.3f}'
+            props = dict(boxstyle='round', facecolor='lightgoldenrodyellow', alpha=0.7)
+            ax3.text(0.02, 0.98, textstr, transform=ax3.transAxes, fontsize=10,
+                    verticalalignment='top', bbox=props)
         ax3.set_title("Суммарная мощность")
 
         # 4. Векторная диаграмма трёх фаз
         ax4 = fig.add_subplot(gs[1, 0])
         self._mini_three_phase_vector(ax4, phases)
 
-        # 5. Относительные амплитуды U и I (фазы A в качестве примера или средние)
+        # 5. Относительные амплитуды U и I
         ax5 = fig.add_subplot(gs[1, 1])
         self._mini_relative_amplitudes(ax5, phases)
 
-        # Удаляем лишний
+        # Удаляем лишний subplot
         fig.delaxes(fig.add_subplot(gs[1, 2]))
         fig.tight_layout()
         self._save_figure(fig, "Общий_анализ_всех_фаз.png")
@@ -4008,6 +4037,7 @@ class HarmonicsApp:
         ax.set_title("Отн. амплитуды")
         ax.legend(fontsize='small')
         ax.grid(True)
+
 
 if __name__ == "__main__":
     root = tk.Tk()
