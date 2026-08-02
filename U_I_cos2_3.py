@@ -1326,27 +1326,28 @@ class HarmonicsApp:
         times = ph['stats']['times_period']
         rms_vals = ph['stats']['rms_periods']
         if len(times) < 2:
-            return  # не строим, если нет периодов
+            return
         fig = Figure(figsize=(14, 8), dpi=300)
         ax = fig.add_subplot(111)
         ax.plot(times, rms_vals, 'b-o', markersize=4)
         nom = self.settings['nominal_voltage']
         ax.axhline(nom, color='r', linestyle='--', label='Номинал')
-        ax.axhline(nom*0.97, color='g', linestyle='--', label='-3%')
+        ax.axhline(nom*0.97, color='g', linestyle='--', label='−3%')
         ax.axhline(nom*1.03, color='g', linestyle='--', label='+3%')
         ax.set_ylim(nom*0.9, nom*1.1)
-        # Подписи
+
+        # Подписи для каждого периода (только если периодов мало)
         if not long_analysis and len(rms_vals) <= 20:
             for t, val in zip(times, rms_vals):
-                ax.text(t, val + 0.5, f"{val:.1f}", ha='center', fontsize=6)
-        else:
-            min_v, max_v, mean_v = np.min(rms_vals), np.max(rms_vals), np.mean(rms_vals)
-            ax.axhline(min_v, color='m', linestyle='--', linewidth=1)
-            ax.axhline(max_v, color='m', linestyle='--', linewidth=1)
-            ax.axhline(mean_v, color='k', linestyle='--', linewidth=1)
-            ax.text(times[0], min_v, f'{min_v:.1f}', va='bottom', fontsize=6)
-            ax.text(times[0], max_v, f'{max_v:.1f}', va='top', fontsize=6)
-            ax.text(times[-1], mean_v, f'{mean_v:.1f}', va='bottom', fontsize=6)
+                ax.text(t, val + 0.3, f"{val:.1f}", ha='center', fontsize=6)
+
+        # Статистика (min, max, среднее) – текст в левом верхнем углу, без лишних линий
+        min_v, max_v, mean_v = np.min(rms_vals), np.max(rms_vals), np.mean(rms_vals)
+        stats_text = f"min: {min_v:.1f} В\nmax: {max_v:.1f} В\nmean: {mean_v:.1f} В"
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', bbox=props)
+
         ax.set_xlabel("Время, с")
         ax.set_ylabel("RMS, В")
         ax.set_title(f"RMS по периодам (±3%) - Фаза {ph['name']}")
