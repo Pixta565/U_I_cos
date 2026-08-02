@@ -581,14 +581,7 @@ class HarmonicsApp:
         elif mode == "Напряжение и ток (одна фаза)":
             if len(voltage_signals) != 1 or len(current_signals) != 1:
                 raise ValueError("Назначьте ровно одно напряжение и один ток")
-            v_sig, i_sig = voltage_signals[0], current_signals[0]
-            res_v = self.process_signal(v_sig, tInc, 'voltage')
-            res_i = self.process_signal(i_sig, tInc, 'current')
-            harm_v, harm_i = self._get_harmonics(v_sig, i_sig, tInc, res_v['f0'])
-            pow_dict = power_from_spectra(harm_v, harm_i, res_v['f0'])
-            self.result_queue.put(("combined_results", {
-                'voltage': res_v, 'current': res_i, 'power': pow_dict
-            }))
+            self.analyze_voltage_current(voltage_signals[0], current_signals[0], tInc)
         else:
             raise ValueError("Некорректная конфигурация каналов для выбранного режима")
 
@@ -686,6 +679,94 @@ class HarmonicsApp:
             'tInc': tInc
         }))
 
+    def analyze_voltage_current(self, v_sig, i_sig, tInc):
+        long_analysis = self.long_analysis_var.get()
+        # Удаление постоянной составляющей для тока
+        i_sig_ac = i_sig - np.mean(i_sig)
+
+        # Анализ напряжения (подробный)
+        f0 = estimate_frequency(v_sig, tInc)
+        v_stats = compute_signal_stats(v_sig, tInc, f0, self.settings['nominal_voltage'], self.settings['rms_tolerance'])
+        v_harmonics = get_harmonic_amplitudes(v_sig, tInc, f0)
+        v_rms_harm = compute_harmonic_rms(v_harmonics)
+        v_thd = calculate_thd(v_rms_harm, v_stats['Urms'])
+        v_violations = check_gost_limits(v_rms_harm, self.settings['nominal_voltage'])
+
+        # Анализ тока (подробный)
+        f0_i = estimate_frequency(i_sig_ac, tInc)  # частота может незначительно отличаться, используем одну
+        i_stats = {
+            'Irms': np.sqrt(np.mean(i_sig_ac**2)),
+            'I1_rms': 0.0, 'I1_peak': 0.0,
+            'THDi': 0.0,
+            'Imax_inst': np.max(i_sig_ac),
+            'Imin_inst': np.min(i_sig_ac),
+            'Ipeak': np.max(np.abs(i_sig_ac)),
+            'crest_factor': 0.0,
+            'rms_periods': [], 'times_period': [],
+            'max_rms_period': 0.0, 'min_rms_period': 0.0, 'avg_rms_period': 0.0,
+            'tInc': tInc, 'N_samples': len(i_sig_ac)
+        }
+        i_harmonics = get_harmonic_amplitudes(i_sig_ac, tInc, f0)
+        i_rms_harm = compute_harmonic_rms(i_harmonics)
+        if 1 in i_rms_harm:
+            i_stats['I1_rms'] = i_rms_harm[1]
+            i_stats['I1_peak'] = i_harmonics[1][0]
+            i_stats['THDi'] = calculate_thd(i_rms_harm, i_stats['I1_rms'])
+            i_stats['crest_factor'] = i_stats['Ipeak'] / i_stats['Irms'] if i_stats['Irms'] else 0.0
+        i_times_period, i_rms_periods = compute_period_rms(i_sig_ac, tInc, f0)
+        i_stats['rms_periods'] = i_rms_periods
+        i_stats['times_period'] = i_times_period
+        if len(i_rms_periods) > 0:
+            i_stats['max_rms_period'] = np.max(i_rms_periods)
+            i_stats['min_rms_period'] = np.min(i_rms_periods)
+            i_stats['avg_rms_period'] = np.mean(i_rms_periods)
+
+        # Мощности
+        harm_v, harm_i = self._get_harmonics(v_sig, i_sig_ac, tInc, f0)
+        pow_dict = power_from_spectra(harm_v, harm_i, f0)
+        # Дополнительно: коэффициент мощности на основной частоте и сдвиг фаз
+        if 1 in harm_v and 1 in harm_i:
+            _, Vc1 = harm_v[1]
+            _, Ic1 = harm_i[1]
+            S1 = Vc1 * np.conj(Ic1) / 2.0
+            P1 = np.real(S1)
+            Q1 = np.imag(S1)
+            pf1 = P1 / np.sqrt(P1**2 + Q1**2) if (P1**2+Q1**2) != 0 else 0
+            phase_shift = np.angle(S1, deg=True)
+        else:
+            pf1 = 0; phase_shift = 0
+
+        data = {
+            'voltage': {
+                'signal': v_sig,
+                'f0': f0,
+                'stats': v_stats,
+                'harmonics': v_harmonics,
+                'rms_harm': v_rms_harm,
+                'thd': v_thd,
+                'violations': v_violations,
+                'tInc': tInc
+            },
+            'current': {
+                'signal': i_sig_ac,
+                'f0': f0,
+                'stats': i_stats,
+                'harmonics': i_harmonics,
+                'rms_harm': i_rms_harm,
+                'thdi': i_stats['THDi'],
+                'tInc': tInc
+            },
+            'power': pow_dict,
+            'pf1': pf1,
+            'phase_shift': phase_shift,
+            'long_analysis': long_analysis,
+            'tInc': tInc
+        }
+        self.result_queue.put(("combined_results_extended", data))
+
+
+
+
 
     def analyze_three_phase(self, paths):
         # Существующий трёхфазный анализ оставляем как есть
@@ -772,6 +853,8 @@ class HarmonicsApp:
                     self.display_three_phase_results(msg[1])
                 elif msg[0] == "current_results_extended":
                     self.handle_extended_current_results(msg[1])
+                elif msg[0] == "combined_results_extended":
+                    self.handle_extended_combined_results(msg[1])
         except queue.Empty:
             pass
         self.root.after(100, self.check_queue)
@@ -819,6 +902,23 @@ class HarmonicsApp:
             self.generate_extended_current_word(data)
         if HAVE_OPENPYXL:
             self.generate_extended_current_excel(data)
+
+    def handle_extended_combined_results(self, data):
+        self.log("=== Расширенный анализ (напряжение + ток) ===")
+        # Логирование основных параметров
+        v = data['voltage']
+        i = data['current']
+        p = data['power']
+        self.log(f"U: f0={v['f0']:.3f} Гц, Urms={v['stats']['Urms']:.2f} В, THD={v['thd']:.2f}%")
+        self.log(f"I: Irms={i['stats']['Irms']:.3f} А, THDi={i['thdi']:.2f}%")
+        self.log(f"P={p['P_total']:.2f} Вт, Q={p['Q_total']:.2f} вар, S={p['S_total']:.2f} ВА, PF={p['pf']:.3f}")
+
+        if HAVE_MPL:
+            self.generate_extended_combined_plots(data)
+        if HAVE_DOCX:
+            self.generate_extended_combined_word(data)
+        if HAVE_OPENPYXL:
+            self.generate_extended_combined_excel(data)
 
     def build_text_report(self, data):
         phases = data['phases']
@@ -1307,8 +1407,357 @@ class HarmonicsApp:
 
             self._save_word(doc, f"Отчет_ток_{ch['name']}.docx")
 
+def generate_extended_combined_word(self, data):
+    doc = self._setup_word_document()
+    # Убираем режим совместимости
+    settings = doc.settings.element
+    for child in settings:
+        if child.tag == qn('w:compat'):
+            settings.remove(child)
+            break
 
+    self._add_heading_word(doc, "Отчёт по напряжению и току")
 
+    # Общие сведения
+    self._add_heading_word(doc, "Общие сведения", level=2)
+    v = data['voltage']
+    i = data['current']
+    tInc = data['tInc']
+    long_analysis = data['long_analysis']
+    self._add_paragraph_word(doc, f"Дата и время анализа: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    self._add_paragraph_word(doc, f"Основная частота: {v['f0']:.3f} Гц")
+    self._add_paragraph_word(doc, f"Частота дискретизации: {1.0/tInc:.2f} Гц")
+    self._add_paragraph_word(doc, f"Количество отсчётов: {v['stats']['N_samples']}")
+    self._add_paragraph_word(doc, f"Масштаб напряжения: x{self.settings['scale_voltage']:.2f}")
+    self._add_paragraph_word(doc, f"Масштаб тока: x{self.settings['scale_current']:.2f}")
+
+    # ---------- Таблица 1. Параметры напряжения ----------
+    self._add_heading_word(doc, "Таблица 1. Параметры напряжения", level=2)
+    self._add_paragraph_word(doc, f"Номинальное напряжение: {self.settings['nominal_voltage']:.1f} В")
+    tbl1 = doc.add_table(rows=1, cols=2)
+    tbl1.style = 'Table Grid'
+    tbl1.alignment = WD_TABLE_ALIGNMENT.CENTER
+    hdr = tbl1.rows[0].cells
+    hdr[0].text = "Параметр"
+    hdr[1].text = "Значение"
+    for cell in hdr:
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0,0,0)
+
+    def add_tbl1_row(label, value, unit="", tol_abs=None):
+        row = tbl1.add_row().cells
+        row[0].text = label
+        val_str = f"{value:.2f}{unit}"
+        row[1].text = val_str
+        if tol_abs is not None and abs(value) > tol_abs:
+            for p in row[1].paragraphs:
+                for run in p.runs:
+                    run.bold = True
+        for cell in row:
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0,0,0)
+
+    s_v = v['stats']
+    add_tbl1_row("Действующее напр. (RMS)", s_v['Urms'], " В")
+    add_tbl1_row("Отклонение напряжения (±3%)", s_v['deviation_percent'], " %", tol_abs=3.0)
+    add_tbl1_row("Макс. мгновенное", s_v['Umax_inst'], " В")
+    add_tbl1_row("Мин. мгновенное", s_v['Umin_inst'], " В")
+    add_tbl1_row("Пиковое напряжение", s_v['Upeak'], " В")
+    add_tbl1_row("Коэф. амплитуды (норма ≤1.41)", s_v['crest_factor'], "", tol_abs=1.41)
+    add_tbl1_row("Макс. RMS за период", s_v['max_rms_period'], " В")
+    add_tbl1_row("Мин. RMS за период", s_v['min_rms_period'], " В")
+    add_tbl1_row("Среднее RMS за период", s_v['avg_rms_period'], " В")
+    self._format_table(tbl1)
+
+    # ---------- Таблица 2. Параметры по фазе ----------
+    self._add_heading_word(doc, "Таблица 2. Параметры по фазе (напряжение)", level=3)
+    tbl2 = doc.add_table(rows=1, cols=2)
+    tbl2.style = 'Table Grid'
+    tbl2.alignment = WD_TABLE_ALIGNMENT.CENTER
+    hdr2 = tbl2.rows[0].cells
+    hdr2[0].text = "Параметр"
+    hdr2[1].text = "Значение"
+    for cell in hdr2:
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0,0,0)
+
+    def add_tbl2_row(label, value, unit="", tol_check=None):
+        row = tbl2.add_row().cells
+        row[0].text = label
+        val_str = f"{value:.2f}{unit}"
+        row[1].text = val_str
+        if tol_check is not None and value > tol_check:
+            for p in row[1].paragraphs:
+                for run in p.runs:
+                    run.bold = True
+        for cell in row:
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0,0,0)
+
+    add_tbl2_row("f0, Гц", v['f0'])
+    add_tbl2_row("Urms, В", s_v['Urms'])
+    add_tbl2_row("U откл., %", s_v['deviation_percent'])
+    add_tbl2_row("Ампл. осн. гарм., В", v['harmonics'].get(1, (0,))[0])
+    ku = v['thd']
+    add_tbl2_row("Ku (THD), % (≤8%)", ku, tol_check=8.0)
+    # Статус Ku
+    if ku <= GOST_THD_LIMITS['norm']:
+        status = "Норма"
+    elif ku <= GOST_THD_LIMITS['max']:
+        status = "Пред."
+    else:
+        status = "Недоп."
+    add_tbl2_row("Статус Ku", status)
+    add_tbl2_row("Нарушений", len(v['violations']))
+    add_tbl2_row("Предупреждений", 0)
+    self._format_table(tbl2)
+
+    # ---------- Таблица 3. Детальная таблица гармоник напряжения ----------
+    self._add_heading_word(doc, "Таблица 3. Детальная таблица гармоник напряжения", level=3)
+    max_harm = 40
+    harm_header = ["№", "Частота, Гц", "Отн. ампл., %", "Предел ГОСТ, %", "Отклонение, %", "Статус", "Таблица ГОСТ"]
+    tbl3 = doc.add_table(rows=1, cols=len(harm_header))
+    tbl3.style = 'Table Grid'
+    tbl3.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, hdr_text in enumerate(harm_header):
+        cell = tbl3.rows[0].cells[i]
+        cell.text = hdr_text
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0,0,0)
+
+    f0 = v['f0']
+    U1_rms = v['rms_harm'].get(1, s_v['Urms'])
+    for h in range(1, max_harm+1):
+        freq = h * f0
+        row_cells = tbl3.add_row().cells
+        row_cells[0].text = str(h)
+        row_cells[1].text = f"{freq:.1f}"
+        rms_h = v['rms_harm'].get(h, 0)
+        rel = (rms_h / U1_rms * 100) if U1_rms else 0.0
+        row_cells[2].text = f"{rel:.2f}"
+        limit = GOST_HARM_ALL.get(h, 0)
+        row_cells[3].text = f"{limit:.2f}"
+        deviation = rel - limit
+        row_cells[4].text = f"{deviation:.2f}"
+        status_h = "Превышение" if (rel > limit and limit > 0) else "Норма"
+        row_cells[5].text = status_h
+        if h % 2 == 0:
+            gost_tbl = "2 (чётные)"
+        elif h % 3 == 0:
+            gost_tbl = "4 (кратные 3)"
+        else:
+            gost_tbl = "3 (некратные 3)"
+        row_cells[6].text = gost_tbl
+
+        if status_h == "Превышение":
+            for cell in row_cells:
+                for p in cell.paragraphs:
+                    for run in p.runs:
+                        run.bold = True
+
+        for cell in row_cells:
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0,0,0)
+    self._format_table(tbl3)
+
+    # ---------- Таблица 4. RMS по периодам (если длительный анализ) ----------
+    if long_analysis:
+        self._add_heading_word(doc, "Таблица 4. Значения RMS напряжений", level=3)
+        rms_vals = s_v['rms_periods']
+        n_periods = len(rms_vals)
+        step = 1
+        if n_periods > 200:
+            step = max(1, round(n_periods / 20))
+            step = max(1, (step // 5) * 5)
+        indices = list(range(0, n_periods, step))
+        tbl4 = doc.add_table(rows=1, cols=2)
+        tbl4.style = 'Table Grid'
+        tbl4.alignment = WD_TABLE_ALIGNMENT.CENTER
+        hdr4 = tbl4.rows[0].cells
+        hdr4[0].text = "№ периода"
+        hdr4[1].text = "RMS, В"
+        for cell in hdr4:
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0,0,0)
+        for idx in indices:
+            row_cells = tbl4.add_row().cells
+            row_cells[0].text = str(idx+1)
+            row_cells[1].text = f"{rms_vals[idx]:.2f}"
+            for cell in row_cells:
+                for p in cell.paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in p.runs:
+                        run.font.name = 'Times New Roman'
+                        run.font.size = Pt(10)
+                        run.font.color.rgb = RGBColor(0,0,0)
+        self._format_table(tbl4)
+
+    # ---------- Таблица 5. Параметры измерений тока ----------
+    self._add_heading_word(doc, "Таблица 5. Параметры измерений тока", level=2)
+    tbl5 = doc.add_table(rows=1, cols=2)
+    tbl5.style = 'Table Grid'
+    tbl5.alignment = WD_TABLE_ALIGNMENT.CENTER
+    hdr5 = tbl5.rows[0].cells
+    hdr5[0].text = "Параметр"
+    hdr5[1].text = "Значение"
+    for cell in hdr5:
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0,0,0)
+
+    s_i = i['stats']
+    rows_i = [
+        ("Действующее значение тока Irms", f"{s_i['Irms']:.3f} А"),
+        ("Амплитуда основной гармоники", f"{s_i['I1_peak']:.3f} А (пик) / {s_i['I1_rms']:.3f} А (RMS)"),
+        ("THDI", f"{s_i['THDi']:.2f} %"),
+        ("Максимальный мгновенный ток", f"{s_i['Imax_inst']:.3f} А"),
+        ("Минимальный мгновенный ток", f"{s_i['Imin_inst']:.3f} А"),
+        ("Пиковый ток", f"{s_i['Ipeak']:.3f} А"),
+        ("Коэффициент амплитуды тока (peak/RMS)", f"{s_i['crest_factor']:.3f}"),
+        ("Анализ по периодам (целых периодов: {})".format(len(s_i['rms_periods'])), str(len(s_i['rms_periods']))),
+        ("Макс. RMS за период", f"{s_i['max_rms_period']:.3f} А"),
+        ("Мин. RMS за период", f"{s_i['min_rms_period']:.3f} А"),
+        ("Среднее RMS за период", f"{s_i['avg_rms_period']:.3f} А")
+    ]
+    for label, value in rows_i:
+        row = tbl5.add_row().cells
+        row[0].text = label
+        row[1].text = value
+        for cell in row:
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0,0,0)
+    self._format_table(tbl5)
+
+    # ---------- Таблица 6. Гармоники тока ----------
+    self._add_heading_word(doc, "Таблица 6. Гармоники тока (1..40)", level=2)
+    tbl6 = doc.add_table(rows=1, cols=5)
+    tbl6.style = 'Table Grid'
+    tbl6.alignment = WD_TABLE_ALIGNMENT.CENTER
+    headers_i = ["№", "Частота, Гц", "Амплитуда, А", "Отн. ампл., %", "Фаза, °"]
+    for i_hdr, h_text in enumerate(headers_i):
+        cell = tbl6.rows[0].cells[i_hdr]
+        cell.text = h_text
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0,0,0)
+
+    I1_rms = s_i['I1_rms']
+    for h in range(1, 41):
+        freq = h * i['f0']
+        amp_peak, comp = i['harmonics'].get(h, (0, 0))
+        amp_rms = amp_peak / np.sqrt(2)
+        rel = (amp_rms / I1_rms * 100) if I1_rms != 0 else 0
+        phase = np.angle(comp, deg=True) if comp != 0 else 0
+        row = tbl6.add_row().cells
+        row[0].text = str(h)
+        row[1].text = f"{freq:.2f}"
+        row[2].text = f"{amp_rms:.4f}"
+        row[3].text = f"{rel:.2f}"
+        row[4].text = f"{phase:.1f}"
+        for cell in row:
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0,0,0)
+    self._format_table(tbl6)
+
+    # ---------- Таблица 7. Мощность и cos φ ----------
+    self._add_heading_word(doc, "Таблица 7. Мощность и cos φ", level=2)
+    tbl7 = doc.add_table(rows=1, cols=2)
+    tbl7.style = 'Table Grid'
+    tbl7.alignment = WD_TABLE_ALIGNMENT.CENTER
+    hdr7 = tbl7.rows[0].cells
+    hdr7[0].text = "Параметр"
+    hdr7[1].text = "Значение"
+    for cell in hdr7:
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0,0,0)
+    pow_data = [
+        ("Активная мощность P", f"{data['power']['P_total']:.2f} Вт"),
+        ("Реактивная мощность Q", f"{data['power']['Q_total']:.2f} вар"),
+        ("Полная мощность S", f"{data['power']['S_total']:.2f} ВА"),
+        ("Коэффициент мощности (общий)", f"{data['power']['pf']:.3f}"),
+        ("Коэффициент мощности (50 Гц)", f"{data['pf1']:.3f}"),
+        ("Сдвиг фаз основной гармоники", f"{data['phase_shift']:.1f}°"),
+        ("THD", f"{v['thd']:.2f}%"),
+        ("THDi", f"{i['thdi']:.2f}%"),
+    ]
+    for label, val in pow_data:
+        row = tbl7.add_row().cells
+        row[0].text = label
+        row[1].text = val
+        for cell in row:
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0,0,0)
+    self._format_table(tbl7)
+
+    # Графики
+    self._add_heading_word(doc, "Графики", level=2)
+    plot_files = [
+        "power_factor_harmonics.png",
+        "power_pie.png",
+        "U_I_relative_amplitudes.png",
+        "U_I_signal.png",
+        "spectrum_U.png",
+        "spectrum_I.png",
+        "vector_diagram.png",
+        "combined_U_I_overview.png"
+    ]
+    for fname in plot_files:
+        fpath = os.path.join(self.save_folder.get(), fname)
+        if os.path.exists(fpath):
+            doc.add_picture(fpath, width=Inches(5.5))
+            self._add_paragraph_word(doc, os.path.basename(fname))
+
+    self._save_word(doc, "Отчет_напряжение_ток.docx")
 
 
 
@@ -1544,7 +1993,169 @@ class HarmonicsApp:
             wb.save(path)
             self.log(f"Excel отчёт по току сохранён: {path}")
 
+    def generate_extended_combined_excel(self, data):
+        wb = openpyxl.Workbook()
+        font_title = Font(name='Times New Roman', size=14, bold=True)
+        font_main = Font(name='Times New Roman', size=14)
+        align_center = Alignment(horizontal='center', vertical='center')
 
+        v = data['voltage']
+        i = data['current']
+        long_analysis = data['long_analysis']
+
+        # ---------- Лист «Общие сведения» ----------
+        ws_info = wb.active
+        ws_info.title = "Общие сведения"
+        info = [
+            ["Параметр", "Значение"],
+            ["Дата и время анализа", datetime.now().strftime('%d.%m.%Y %H:%M:%S')],
+            ["Основная частота, Гц", f"{v['f0']:.3f}"],
+            ["Частота дискретизации, Гц", f"{1.0 / data['tInc']:.2f}"],
+            ["Количество отсчётов", str(v['stats']['N_samples'])],
+            ["Масштаб напряжения", f"{self.settings['scale_voltage']:.2f}"],
+            ["Масштаб тока", f"{self.settings['scale_current']:.2f}"],
+        ]
+        self._write_sheet_data(ws_info, info, font_main, align_center)
+
+        # ---------- Лист «Параметры напряжения» ----------
+        ws_volt = wb.create_sheet("Параметры напряжения")
+        self._write_excel_row(ws_volt, 1, ["Параметр", "Значение"], font_title, align_center)
+        s_v = v['stats']
+        volt_data = [
+            ["Urms, В", s_v['Urms']],
+            ["Отклонение, %", s_v['deviation_percent']],
+            ["U макс. мгн., В", s_v['Umax_inst']],
+            ["U мин. мгн., В", s_v['Umin_inst']],
+            ["U пик., В", s_v['Upeak']],
+            ["Коэф. ампл.", s_v['crest_factor']],
+            ["Макс. RMS пер., В", s_v['max_rms_period']],
+            ["Мин. RMS пер., В", s_v['min_rms_period']],
+            ["Ср. RMS пер., В", s_v['avg_rms_period']]
+        ]
+        for r, (label, val) in enumerate(volt_data, 2):
+            self._write_excel_row(ws_volt, r, [label, f"{val:.2f}"], font_main, align_center)
+
+        # ---------- Лист «Гармоники напряжения» ----------
+        ws_harm_v = wb.create_sheet("Гармоники напряжения")
+        self._write_excel_row(ws_harm_v, 1, 
+            ["Гармоника", "Частота, Гц", "Амплитуда, В", "Отн. ампл., %", "Предел ГОСТ, %"],
+            font_title, align_center)
+        U1 = s_v['Urms']
+        for h in range(1, 41):
+            freq = h * v['f0']
+            amp = v['rms_harm'].get(h, 0)
+            rel = (amp / U1 * 100) if U1 else 0
+            limit = GOST_HARM_ALL.get(h, 0)
+            self._write_excel_row(ws_harm_v, h + 1, [h, f"{freq:.1f}", f"{amp:.2f}", f"{rel:.2f}", f"{limit:.2f}"],
+                                  font_main, align_center)
+
+        # ---------- Лист «RMS по периодам» (если длительный анализ) ----------
+        if long_analysis:
+            ws_rms = wb.create_sheet("RMS по периодам U")
+            self._write_excel_row(ws_rms, 1, ["Период", "RMS, В"], font_title, align_center)
+            rms_vals = s_v['rms_periods']
+            n_periods = len(rms_vals)
+            step = 1
+            if n_periods > 200:
+                step = max(1, round(n_periods / 20))
+                step = max(1, (step // 5) * 5)
+            row = 2
+            for idx in range(0, n_periods, step):
+                self._write_excel_row(ws_rms, row, [idx + 1, f"{rms_vals[idx]:.2f}"], font_main, align_center)
+                row += 1
+
+        # ---------- Лист «График» ----------
+        ws_chart = wb.create_sheet("График")
+        chart_headers = ["Гармоника", "Отн. ампл., %", "Предел ГОСТ, %"]
+        self._write_excel_row(ws_chart, 1, chart_headers, font_title, align_center)
+        row_chart = 2
+        for h in range(2, 40):
+            amp = v['rms_harm'].get(h, 0)
+            rel = (amp / U1 * 100) if U1 else 0
+            limit = GOST_HARM_ALL.get(h, 0)
+            self._write_excel_row(ws_chart, row_chart, [h, rel, limit], font_main, align_center)
+            row_chart += 1
+
+        # Диаграмма
+        chart = BarChart()
+        chart.type = "col"
+        chart.style = 10
+        chart.title = "Гармонический состав и пределы ГОСТ (без 1-й гармоники)"
+        chart.y_axis.title = "%"
+        chart.x_axis.title = "Номер гармоники"
+        data_ref = Reference(ws_chart, min_col=2, min_row=1, max_row=row_chart - 1)
+        cats_ref = Reference(ws_chart, min_col=1, min_row=2, max_row=row_chart - 1)
+        chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
+        chart.series[0].graphicalProperties.solidFill = "4472C4"
+
+        from openpyxl.chart import LineChart
+        line_chart = LineChart()
+        line_chart.add_data(Reference(ws_chart, min_col=3, min_row=1, max_row=row_chart - 1), titles_from_data=True)
+        line_chart.series[0].graphicalProperties.line.solidFill = "ED7D31"
+        line_chart.series[0].graphicalProperties.line.width = 25000
+        line_chart.y_axis.axId = 200
+        line_chart.set_categories(cats_ref)
+        chart += line_chart
+        chart.y_axis.crosses = "min"
+        ws_chart.add_chart(chart, "E2")
+
+        # ---------- Лист «Параметры тока» ----------
+        ws_param_i = wb.create_sheet("Параметры тока")
+        self._write_excel_row(ws_param_i, 1, ["Параметр", "Значение"], font_title, align_center)
+        s_i = i['stats']
+        current_data = [
+            ["Действующее значение тока Irms, А", s_i['Irms']],
+            ["Амплитуда основной гармоники (пик), А", s_i['I1_peak']],
+            ["THDI, %", s_i['THDi']],
+            ["Максимальный мгновенный ток, А", s_i['Imax_inst']],
+            ["Минимальный мгновенный ток, А", s_i['Imin_inst']],
+            ["Пиковый ток, А", s_i['Ipeak']],
+            ["Коэффициент амплитуды тока", s_i['crest_factor']],
+            ["Целых периодов", len(s_i['rms_periods'])],
+            ["Макс. RMS за период, А", s_i['max_rms_period']],
+            ["Мин. RMS за период, А", s_i['min_rms_period']],
+            ["Среднее RMS за период, А", s_i['avg_rms_period']]
+        ]
+        for r, (label, val) in enumerate(current_data, 2):
+            self._write_excel_row(ws_param_i, r, [label, f"{val:.2f}"], font_main, align_center)
+
+        # ---------- Лист «Гармоники тока» ----------
+        ws_harm_i = wb.create_sheet("Гармоники тока")
+        self._write_excel_row(ws_harm_i, 1, 
+            ["№", "Частота, Гц", "Амплитуда, А", "Отн. ампл., %", "Фаза, °"],
+            font_title, align_center)
+        I1_rms = s_i['I1_rms']
+        for h in range(1, 41):
+            freq = h * i['f0']
+            amp_peak, comp = i['harmonics'].get(h, (0, 0))
+            amp_rms = amp_peak / np.sqrt(2)
+            rel = (amp_rms / I1_rms * 100) if I1_rms else 0
+            phase = np.angle(comp, deg=True) if comp != 0 else 0.0
+            self._write_excel_row(ws_harm_i, h + 1, [h, f"{freq:.1f}", f"{amp_rms:.4f}", f"{rel:.2f}", f"{phase:.1f}"],
+                                  font_main, align_center)
+
+        # ---------- Лист «Мощность» ----------
+        ws_pow = wb.create_sheet("Мощность")
+        self._write_excel_row(ws_pow, 1, ["Параметр", "Значение"], font_title, align_center)
+        pow_rows = [
+            ["P, Вт", data['power']['P_total']],
+            ["Q, вар", data['power']['Q_total']],
+            ["S, ВА", data['power']['S_total']],
+            ["PF общий", data['power']['pf']],
+            ["PF (50 Гц)", data['pf1']],
+            ["Сдвиг фаз, °", data['phase_shift']],
+            ["THD, %", v['thd']],
+            ["THDi, %", i['thdi']],
+        ]
+        for r, (label, val) in enumerate(pow_rows, 2):
+            self._write_excel_row(ws_pow, r, [label, f"{val:.2f}" if isinstance(val, float) else val],
+                                  font_main, align_center)
+
+        # Сохранение
+        path = os.path.join(self.save_folder.get(), "Отчет_напряжение_ток.xlsx")
+        wb.save(path)
+        self.log(f"Excel отчёт сохранён: {path}")
 
 
     # ========== ГРАФИКИ (фото) ==========
@@ -1970,7 +2581,188 @@ class HarmonicsApp:
         fig.tight_layout()
         self._save_figure(fig, f"Общий_анализ_тока_{ch['name']}.png")
 
+    def generate_extended_combined_plots(self, data):
+        self._plot_power_factor_harmonics(data)
+        self._plot_power_pie(data)
+        self._plot_ui_relative_amplitudes(data)
+        self._plot_ui_signal(data)
+        self._plot_spectrum(data['voltage']['signal'], data['tInc'], "spectrum_U.png", "Спектр напряжения")
+        self._plot_spectrum(data['current']['signal'], data['tInc'], "spectrum_I.png", "Спектр тока")
+        self._plot_vector_diagram(data)
+        self._plot_combined_ui_overview(data)
 
+    def _plot_power_factor_harmonics(self, data):
+        fig = Figure(figsize=(14, 8), dpi=300)
+        ax = fig.add_subplot(111)
+        h_list = list(range(1, 41))
+        pfs = []
+        for h in h_list:
+            if h in data['power']['P_harm']:
+                P = data['power']['P_harm'][h]
+                Q = data['power']['Q_harm'][h]
+                S = np.sqrt(P**2 + Q**2)
+                pf = P / S if S != 0 else 0
+                pfs.append(pf)
+            else:
+                pfs.append(0)
+        ax.bar(h_list, pfs, color='teal')
+        ax.set_xlabel("Номер гармоники")
+        ax.set_ylabel("Коэффициент мощности")
+        ax.set_title("Коэффициент мощности по гармоникам")
+        ax.grid(True)
+        self._save_figure(fig, "power_factor_harmonics.png")
+
+    def _plot_power_pie(self, data):
+        fig = Figure(figsize=(10, 10), dpi=300)
+        ax = fig.add_subplot(111)
+        P = abs(data['power']['P_total'])
+        Q = abs(data['power']['Q_total'])
+        if P == 0 and Q == 0:
+            ax.text(0.5, 0.5, "S = 0", transform=ax.transAxes, ha='center')
+            ax.axis('off')
+        else:
+            labels = ['Активная P', 'Реактивная Q']
+            sizes = [P, Q]
+            ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+            ax.set_title("Составляющие полной мощности")
+        self._save_figure(fig, "power_pie.png")
+
+    def _plot_ui_relative_amplitudes(self, data):
+        fig = Figure(figsize=(14, 8), dpi=300)
+        ax = fig.add_subplot(111)
+        h_list = list(range(2, 41))
+        u1 = data['voltage']['stats']['Urms']
+        i1 = data['current']['stats']['I1_rms']
+        u_rel = [(data['voltage']['rms_harm'].get(h,0)/u1*100) if u1 else 0 for h in h_list]
+        i_rel = [(data['current']['rms_harm'].get(h,0)/i1*100) if i1 else 0 for h in h_list]
+        x = np.arange(len(h_list))
+        width = 0.35
+        ax.bar(x - width/2, u_rel, width, label='U, %', color='coral')
+        ax.bar(x + width/2, i_rel, width, label='I, %', color='teal')
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(h) for h in h_list])
+        ax.set_xlabel("Номер гармоники")
+        ax.set_ylabel("Относительная амплитуда, %")
+        ax.set_title("Относительные амплитуды гармоник U и I (без 1-й)")
+        ax.legend()
+        ax.grid(True)
+        self._save_figure(fig, "U_I_relative_amplitudes.png")
+
+    def _plot_ui_signal(self, data):
+        fig = Figure(figsize=(14, 8), dpi=300)
+        ax = fig.add_subplot(111)
+        t = np.arange(len(data['voltage']['signal'])) * data['tInc']
+        ax.plot(t, data['voltage']['signal'], label='Напряжение', alpha=0.8)
+        ax.plot(t, data['current']['signal'], label='Ток', alpha=0.8)
+        ax.set_xlabel("Время, с")
+        ax.set_ylabel("Значение")
+        ax.set_title("Напряжение и ток фазы")
+        ax.legend()
+        ax.grid(True)
+        self._save_figure(fig, "U_I_signal.png")
+
+    def _plot_spectrum(self, signal, tInc, filename, title):
+        fig = Figure(figsize=(14, 8), dpi=300)
+        ax = fig.add_subplot(111)
+        N = len(signal)
+        window = np.hanning(N)
+        y = signal * window
+        Y = rfft(y)
+        freqs = rfftfreq(N, tInc)
+        ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
+        ax.set_xlim(0, 2000)
+        ax.set_xlabel("Частота, Гц")
+        ax.set_ylabel("Амплитуда")
+        ax.set_title(title)
+        ax.grid(True)
+        self._save_figure(fig, filename)
+
+    def _plot_vector_diagram(self, data):
+        fig = Figure(figsize=(8, 8), dpi=300)
+        ax = fig.add_subplot(111, polar=False)
+        # Упрощённая векторная диаграмма тока и напряжения
+        if 1 in data['voltage']['harmonics'] and 1 in data['current']['harmonics']:
+            _, Vc = data['voltage']['harmonics'][1]
+            _, Ic = data['current']['harmonics'][1]
+            V_phasor = Vc / np.sqrt(2)  # RMS вектор
+            I_phasor = Ic / np.sqrt(2)
+            ax.arrow(0, 0, np.real(V_phasor), np.imag(V_phasor), color='red', width=1.0, label='U')
+            ax.arrow(0, 0, np.real(I_phasor), np.imag(I_phasor), color='blue', width=1.0, label='I')
+            ax.set_xlabel("Действительная ось")
+            ax.set_ylabel("Мнимая ось")
+            ax.set_title("Векторная диаграмма основной гармоники")
+            ax.legend()
+            ax.axis('equal')
+            ax.grid(True)
+        else:
+            ax.text(0.5, 0.5, "Нет данных", transform=ax.transAxes, ha='center')
+            ax.axis('off')
+        self._save_figure(fig, "vector_diagram.png")
+
+    def _plot_combined_ui_overview(self, data):
+        fig = Figure(figsize=(20, 12), dpi=300)
+        axs = fig.subplots(2, 3)
+        # 1. U и I сигнал
+        ax = axs[0,0]
+        t = np.arange(len(data['voltage']['signal'])) * data['tInc']
+        ax.plot(t, data['voltage']['signal'], 'r', alpha=0.8, label='U')
+        ax.plot(t, data['current']['signal'], 'b', alpha=0.8, label='I')
+        ax.set_title("Напряжение и ток")
+        ax.legend()
+        ax.grid(True)
+
+        # 2. Спектр U
+        ax = axs[0,1]
+        sig_u = data['voltage']['signal']
+        N = len(sig_u)
+        win = np.hanning(N)
+        Y = rfft(sig_u * win)
+        freqs = rfftfreq(N, data['tInc'])
+        ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
+        ax.set_xlim(0, 2000)
+        ax.set_title("Спектр U")
+
+        # 3. Спектр I
+        ax = axs[0,2]
+        sig_i = data['current']['signal']
+        N = len(sig_i)
+        Y = rfft(sig_i * win)
+        freqs = rfftfreq(N, data['tInc'])
+        ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
+        ax.set_xlim(0, 2000)
+        ax.set_title("Спектр I")
+
+        # 4. Коэффициент мощности по гармоникам
+        ax = axs[1,0]
+        h_list = range(1, 41)
+        pfs = []
+        for h in h_list:
+            if h in data['power']['P_harm']:
+                P = data['power']['P_harm'][h]
+                Q = data['power']['Q_harm'][h]
+                S = np.sqrt(P**2+Q**2)
+                pfs.append(P/S if S else 0)
+            else:
+                pfs.append(0)
+        ax.bar(h_list, pfs, color='teal')
+        ax.set_title("Коэффициент мощности")
+        ax.grid(True)
+
+        # 5. Круговая диаграмма мощности
+        ax = axs[1,1]
+        P = abs(data['power']['P_total'])
+        Q = abs(data['power']['Q_total'])
+        if P == 0 and Q == 0:
+            ax.text(0.5, 0.5, "S=0", transform=ax.transAxes, ha='center')
+            ax.axis('off')
+        else:
+            ax.pie([P, Q], labels=['Активная P','Реактивная Q'], autopct='%1.1f%%')
+        ax.set_title("Составляющие мощности")
+
+        # Пустой subplot (можно убрать)
+        fig.delaxes(axs[1,2])
+        fig.tight_layout()
+        self._save_figure(fig, "combined_U_I_overview.png")
 
 
     # -------------------- Обработчики других режимов (оставлены для совместимости) --------------------
