@@ -892,6 +892,30 @@ class HarmonicsApp:
             'tInc': tInc
         }))
 
+    def process_signal(self, signal, tInc, sig_type):
+        f0 = estimate_frequency(signal, tInc)
+        harmonics = get_harmonic_amplitudes(signal, tInc, f0)
+        rms_harm = compute_harmonic_rms(harmonics)
+        fundamental_rms = rms_harm.get(1, 0)
+        thd = calculate_thd(rms_harm, fundamental_rms)
+        result = {
+            'f0': f0,
+            'fundamental_rms': fundamental_rms,
+            'harmonic_rms': rms_harm,
+            'thd': thd,
+            'type': sig_type
+        }
+        if sig_type == 'voltage':
+            result['gost_violations'] = check_gost_limits(rms_harm, self.settings['nominal_voltage'])
+        return result
+
+    def _get_harmonics(self, v_sig, i_sig, tInc, f0=None):
+        if f0 is None:
+            f0 = estimate_frequency(v_sig, tInc)
+        harm_v = get_harmonic_amplitudes(v_sig, tInc, f0)
+        harm_i = get_harmonic_amplitudes(i_sig, tInc, f0)
+        return harm_v, harm_i
+
     def check_queue(self):
             try:
                 while True:
@@ -3054,7 +3078,9 @@ class HarmonicsApp:
             self._plot_harmonics_with_gost(ph, start_harm=2, end_harm=40)
         # 5. Амплитудный спектр (без чисел)
         for ph in phases:
-            self._plot_spectrum(ph)
+            self._plot_spectrum(ph['signal'], ph['tInc'], 
+                        f"Амплитудный_спектр_фаза_{ph['name']}.png", 
+                        f"Амплитудный спектр фазы {ph['name']}")
         # 6. Сигнал (временная диаграмма)
         for ph in phases:
             self._plot_signal(ph)
@@ -3387,7 +3413,11 @@ class HarmonicsApp:
         Y = rfft(y)
         freqs = rfftfreq(N, ch['tInc'])
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
-        ax.set_xlim(0, 2000)
+        ax.set_xlim(60, 2000)
+        mask = (freqs >= 60) & (freqs <= 2000)
+        if np.any(mask):
+            y_max = np.max(np.abs(Y[mask]))
+        ax.set_ylim(0, y_max * 1.1)
         ax.set_xlabel("Частота, Гц")
         ax.set_ylabel("Амплитуда")
         ax.set_title(f"Амплитудный спектр тока - {ch['name']}")
@@ -3631,6 +3661,10 @@ class HarmonicsApp:
         freqs = rfftfreq(N, data['tInc'])
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
         ax.set_xlim(60, 2000)
+        mask = (freqs >= 60) & (freqs <= 2000)
+        if np.any(mask):
+            y_max = np.max(np.abs(Y[mask]))
+        ax.set_ylim(0, y_max * 1.1)
         ax.set_title("Спектр I")
 
         # 4. Коэффициент мощности по гармоникам
@@ -4037,6 +4071,368 @@ class HarmonicsApp:
         ax.set_title("Отн. амплитуды")
         ax.legend(fontsize='small')
         ax.grid(True)
+
+ # -------------------- Обработчики других режимов (оставлены для совместимости) --------------------
+    def display_current_results(self, results):
+        report = "=== Результаты анализа тока ===\n"
+        for ch, res in results.items():
+            report += f"\nКанал {ch}:\n  Частота сети: {res['f0']:.2f} Гц\n  I1 RMS: {res['fundamental_rms']:.3f} А\n  THDi: {res['thd']:.2f}%\n"
+        self.log(report)
+        if self.have_plots and results:
+            first_ch = list(results.values())[0]
+            self.plot_harmonics(first_ch['harmonic_rms'], "Ток", "А")
+            self.save_plot_image("График_гармоник_тока.png")
+        if HAVE_DOCX:
+            self.generate_current_report_word(results)
+        if HAVE_OPENPYXL:
+            self.export_harmonics_to_excel(results, "Данные_гармоник_тока.xlsx", "Ток")
+
+    def display_combined_results(self, res):
+        v = res['voltage']; i = res['current']; p = res['power']
+        report = "=== Результаты анализа (U + I одной фазы) ===\n"
+        report += f"\nНапряжение:\n  f0={v['f0']:.2f} Гц, U1={v['fundamental_rms']:.3f} В, THD={v['thd']:.2f}%\n"
+        if v.get('gost_violations'):
+            for viol in v['gost_violations']:
+                report += f"    Нарушение: {viol}\n"
+        report += f"\nТок:\n  I1={i['fundamental_rms']:.3f} А, THDi={i['thd']:.2f}%\n"
+        report += f"\nМощности:\n  P={p['P_total']:.2f} Вт, Q={p['Q_total']:.2f} вар, S={p['S_total']:.2f} ВА, PF={p['pf']:.3f}\n"
+        self.log(report)
+        if self.have_plots:
+            self.plot_combined(v['harmonic_rms'], i['harmonic_rms'])
+            self.save_plot_image("График_гармоник_U_I.png")
+        if HAVE_DOCX:
+            self.generate_combined_report_word(res)
+        if HAVE_OPENPYXL:
+            self.export_combined_excel(v, i, p)
+
+    def display_three_phase_results(self, data):
+        report = "=== Результаты трёхфазного анализа ===\n"
+        for ph in data['phases']:
+            report += f"\nФаза {ph['phase']}:\n"
+            report += f"  U1={ph['voltage']['fundamental_rms']:.3f} В, THD={ph['voltage']['thd']:.2f}%\n"
+            report += f"  I1={ph['current']['fundamental_rms']:.3f} А, THDi={ph['current']['thd']:.2f}%\n"
+            report += f"  P={ph['power']['P_total']:.2f} Вт, Q={ph['power']['Q_total']:.2f} вар, S={ph['power']['S_total']:.2f} ВА, PF={ph['power']['pf']:.3f}\n"
+        tp = data['total_power']
+        report += f"\nСуммарно:\n  P={tp['P_total']:.2f} Вт, Q={tp['Q_total']:.2f} вар, S={tp['S_total']:.2f} ВА, PF={tp['pf']:.3f}\n"
+        report += f"Общий THDv (макс): {data['overall_thd_v']:.2f}%, THDi (макс): {data['overall_thd_i']:.2f}%\n"
+        self.log(report)
+        if self.have_plots and data['phases']:
+            v_h = data['phases'][0]['voltage']['harmonic_rms']
+            i_h = data['phases'][0]['current']['harmonic_rms']
+            self.plot_combined(v_h, i_h)
+            self.save_plot_image("График_трёхфазный.png")
+        if HAVE_DOCX:
+            self.generate_three_phase_report_word(data)
+        if HAVE_OPENPYXL:
+            self.export_three_phase_excel(data)
+
+    # ========== Методы для старых отчётов Word (оставлены) ==========
+    def _setup_word_document(self):
+        doc = Document()
+        section = doc.sections[0]
+        section.orientation = 1  # landscape
+        section.page_width = Cm(29.7)
+        section.page_height = Cm(21.0)
+        section.top_margin = Cm(1.5)
+        section.bottom_margin = Cm(1.5)
+        section.left_margin = Cm(0.75)
+        section.right_margin = Cm(0.75)
+        return doc
+
+    def _add_heading_word(self, doc, text, level=1):
+        heading = doc.add_heading(text, level=level)
+        for run in heading.runs:
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(18) if level==1 else Pt(14)
+            run.font.color.rgb = RGBColor(0, 0, 0)
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        heading.paragraph_format.space_before = Pt(0)
+        heading.paragraph_format.space_after = Pt(0)
+        heading.paragraph_format.line_spacing = 1.5
+
+    def _add_paragraph_word(self, doc, text, bold=False):
+        p = doc.add_paragraph()
+        run = p.add_run(text)
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(14)
+        run.font.color.rgb = RGBColor(0, 0, 0)
+        run.bold = bold
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        p.paragraph_format.first_line_indent = Cm(1.25)
+        p.paragraph_format.line_spacing = 1.5
+        p.paragraph_format.space_after = Pt(0)
+        return p
+
+    def _add_table_word(self, doc, headers, rows, col_widths=None):
+        table = doc.add_table(rows=1, cols=len(headers))
+        table.style = 'Table Grid'
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = True
+        hdr_cells = table.rows[0].cells
+        for i, header in enumerate(headers):
+            hdr_cells[i].text = header
+            for paragraph in hdr_cells[i].paragraphs:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in paragraph.runs:
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0, 0, 0)
+        for row_data in rows:
+            row_cells = table.add_row().cells
+            for i, val in enumerate(row_data):
+                row_cells[i].text = str(val)
+                for paragraph in row_cells[i].paragraphs:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in paragraph.runs:
+                        run.font.name = 'Times New Roman'
+                        run.font.size = Pt(10)
+                        run.font.color.rgb = RGBColor(0, 0, 0)
+        if col_widths:
+            for i, width in enumerate(col_widths):
+                for row in table.rows:
+                    row.cells[i].width = Cm(width)
+        for row in table.rows:
+            tr = row._tr
+            trPr = tr.get_or_add_trPr()
+            trHeight = qn('w:trHeight')
+            trPr.set(trHeight, str(int(0.7 * 567)))  # 0.7 cm
+        return table
+
+    def _format_table(self, table, header_color='DAE9F7'):
+        """Настройка таблицы: повтор заголовка, заливка, высота строк 0.7 см, вертикальное выравнивание."""
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        tbl_pr = table._tbl.tblPr
+        header_el = OxmlElement('w:tblHeader')
+        header_el.set(qn('w:val'), 'true')
+        tbl_pr.append(header_el)
+
+        for row_idx, row in enumerate(table.rows):
+            tr = row._tr
+            trPr = tr.get_or_add_trPr()
+            trHeight = OxmlElement('w:trHeight')
+            trHeight.set(qn('w:val'), str(int(0.7 * 567)))
+            trHeight.set(qn('w:hRule'), 'exact')
+            trPr.append(trHeight)
+
+            for cell in row.cells:
+                tc = cell._tc
+                tcPr = tc.get_or_add_tcPr()
+                # Вертикальное выравнивание по центру
+                vAlign = OxmlElement('w:vAlign')
+                vAlign.set(qn('w:val'), 'center')
+                tcPr.append(vAlign)
+                # Горизонтальное выравнивание уже задано через параграфы, но можно и здесь
+                # Заливка заголовка
+                if row_idx == 0:
+                    shd = OxmlElement('w:shd')
+                    shd.set(qn('w:val'), 'clear')
+                    shd.set(qn('w:fill'), header_color)
+                    tcPr.append(shd)
+
+    def _save_word(self, doc, filename):
+        path = os.path.join(self.save_folder.get(), filename)
+        doc.save(path)
+        self.log(f"Отчёт Word сохранён: {path}")
+
+    # Остальные методы generate_*_word для других режимов оставлены как заглушки, при необходимости можно дополнить
+    def generate_current_report_word(self, results):
+        doc = self._setup_word_document()
+        self._add_heading_word(doc, "Результаты анализа гармоник тока")
+        self._add_paragraph_word(doc, f"Дата анализа: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+        for ch, res in results.items():
+            self._add_paragraph_word(doc, f"Канал: {ch}", bold=True)
+            self._add_paragraph_word(doc, f"f0: {res['f0']:.2f} Гц")
+            self._add_paragraph_word(doc, f"I1: {res['fundamental_rms']:.3f} А, THDi: {res['thd']:.2f}%")
+            harm = res['harmonic_rms']
+            headers = ["№", "I, А", "% от I1"]
+            rows = []
+            i1 = res['fundamental_rms']
+            for h in sorted(harm.keys()):
+                a = harm[h]
+                rows.append([h, f"{a:.2f}", f"{(a/i1*100):.2f}" if i1 else "0.00"])
+            if rows:
+                self._add_table_word(doc, headers, rows, col_widths=[1.5,5,5])
+        self._save_word(doc, "Отчет_анализ_тока.docx")
+
+    def generate_combined_report_word(self, res):
+        doc = self._setup_word_document()
+        self._add_heading_word(doc, "Результаты анализа U и I одной фазы")
+        v = res['voltage']; i = res['current']; p = res['power']
+        self._add_paragraph_word(doc, f"Напряжение: f0={v['f0']:.2f} Гц, U1={v['fundamental_rms']:.3f} В, THD={v['thd']:.2f}%")
+        self._add_paragraph_word(doc, f"Ток: I1={i['fundamental_rms']:.3f} А, THDi={i['thd']:.2f}%")
+        self._add_paragraph_word(doc, f"Мощности: P={p['P_total']:.2f} Вт, Q={p['Q_total']:.2f} вар, S={p['S_total']:.2f} ВА, PF={p['pf']:.3f}")
+        self._save_word(doc, "Отчет_анализ_U_I.docx")
+
+    def generate_three_phase_report_word(self, data):
+        doc = self._setup_word_document()
+        self._add_heading_word(doc, "Результаты трёхфазного анализа гармоник")
+        for ph in data['phases']:
+            self._add_paragraph_word(doc, f"Фаза {ph['phase']}")
+            v = ph['voltage']; i = ph['current']; p = ph['power']
+            self._add_paragraph_word(doc, f"U1={v['fundamental_rms']:.3f} В, THD={v['thd']:.2f}%, I1={i['fundamental_rms']:.3f} А")
+            self._add_paragraph_word(doc, f"P={p['P_total']:.2f} Вт, Q={p['Q_total']:.2f} вар, S={p['S_total']:.2f} ВА, PF={p['pf']:.3f}")
+        tp = data['total_power']
+        self._add_paragraph_word(doc, f"Суммарно: P={tp['P_total']:.2f} Вт, Q={tp['Q_total']:.2f} вар, S={tp['S_total']:.2f} ВА")
+        self._save_word(doc, "Отчет_трёхфазный_анализ.docx")
+
+    # Экспорт в Excel для других режимов (оставлены)
+    def export_harmonics_to_excel(self, results, filename, sheet_prefix):
+        wb, ws, font, align = self._prepare_excel_workbook()
+        ws.title = f"{sheet_prefix}_гармоники"
+        headers = ["Гармоника", "Амплитуда (RMS)", "% от основной"]
+        self._write_excel_header(ws, headers, 1, font, align)
+        row = 2
+        for ch, res in results.items():
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+            cell = ws.cell(row=row, column=1, value=f"Канал {ch}")
+            cell.font = Font(name='Times New Roman', size=14, bold=True)
+            cell.alignment = align
+            row += 1
+            fundamental = res['fundamental_rms']
+            for h in sorted(res['harmonic_rms'].keys()):
+                val = res['harmonic_rms'][h]
+                perc = (val / fundamental * 100) if fundamental != 0 else 0.0
+                self._write_excel_data(ws, [[h, val, perc]], row, font, align)
+                row += 1
+            row += 1
+        path = os.path.join(self.save_folder.get(), filename)
+        wb.save(path)
+        self.log(f"Данные Excel сохранены: {path}")
+
+    def export_combined_excel(self, v_res, i_res, p):
+        wb = openpyxl.Workbook()
+        font = Font(name='Times New Roman', size=14)
+        align = Alignment(horizontal='center', vertical='center')
+        ws_v = wb.active; ws_v.title = "Напряжение"
+        headers = ["Гармоника", "U, В", "% от U1"]
+        self._write_excel_header(ws_v, headers, 1, font, align)
+        u1 = v_res['fundamental_rms']
+        row = 2
+        for h in sorted(v_res['harmonic_rms'].keys()):
+            val = v_res['harmonic_rms'][h]
+            perc = (val/u1*100) if u1 else 0
+            self._write_excel_data(ws_v, [[h, val, perc]], row, font, align)
+            row += 1
+        ws_i = wb.create_sheet("Ток")
+        headers = ["Гармоника", "I, А", "% от I1"]
+        self._write_excel_header(ws_i, headers, 1, font, align)
+        i1 = i_res['fundamental_rms']
+        row = 2
+        for h in sorted(i_res['harmonic_rms'].keys()):
+            val = i_res['harmonic_rms'][h]
+            perc = (val/i1*100) if i1 else 0
+            self._write_excel_data(ws_i, [[h, val, perc]], row, font, align)
+            row += 1
+        ws_p = wb.create_sheet("Мощности")
+        self._write_excel_header(ws_p, ["Параметр", "Значение"], 1, font, align)
+        self._write_excel_data(ws_p, [["P, Вт", p['P_total']], ["Q, вар", p['Q_total']], ["S, ВА", p['S_total']], ["PF", p['pf']]], 2, font, align)
+        path = os.path.join(self.save_folder.get(), "Данные_гармоник_U_I.xlsx")
+        wb.save(path)
+        self.log(f"Данные Excel сохранены: {path}")
+
+    def export_three_phase_excel(self, data):
+        wb = openpyxl.Workbook()
+        font = Font(name='Times New Roman', size=14)
+        align = Alignment(horizontal='center', vertical='center')
+        for ph in data['phases']:
+            ws = wb.create_sheet(f"Фаза_{ph['phase']}")
+            self._write_excel_header(ws, ["Гармоника", "U, В", "% U1", "I, А", "% I1"], 1, font, align)
+            v_h = ph['voltage']['harmonic_rms']; i_h = ph['current']['harmonic_rms']
+            u1 = ph['voltage']['fundamental_rms']; i1 = ph['current']['fundamental_rms']
+            row = 2
+            for h in sorted(set(list(v_h.keys()) + list(i_h.keys()))):
+                v_val = v_h.get(h, 0); i_val = i_h.get(h, 0)
+                v_perc = (v_val/u1*100) if u1 else 0
+                i_perc = (i_val/i1*100) if i1 else 0
+                self._write_excel_data(ws, [[h, v_val, v_perc, i_val, i_perc]], row, font, align)
+                row += 1
+        ws_sum = wb.create_sheet("Суммарно")
+        self._write_excel_header(ws_sum, ["Параметр", "Значение"], 1, font, align)
+        tp = data['total_power']
+        sum_data = [
+            ["P, Вт", tp['P_total']], ["Q, вар", tp['Q_total']], ["S, ВА", tp['S_total']],
+            ["PF", tp['pf'] if tp['pf'] else 0], ["THDv макс", data['overall_thd_v']], ["THDi макс", data['overall_thd_i']]
+        ]
+        self._write_excel_data(ws_sum, sum_data, 2, font, align)
+        path = os.path.join(self.save_folder.get(), "Данные_трёхфазные.xlsx")
+        wb.save(path)
+        self.log(f"Данные Excel сохранены: {path}")
+
+    def _prepare_excel_workbook(self):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        font = Font(name='Times New Roman', size=14, color='000000')
+        align = Alignment(horizontal='center', vertical='center')
+        return wb, ws, font, align
+
+    def _write_excel_header(self, ws, headers, row, font, align):
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=row, column=c, value=h)
+            cell.font = font
+            cell.alignment = align
+
+    def _write_excel_data(self, ws, data, start_row, font, align):
+        for r, row_data in enumerate(data, start_row):
+            for c, value in enumerate(row_data, 1):
+                cell = ws.cell(row=r, column=c, value=value)
+                cell.font = font
+                cell.alignment = align
+                if isinstance(value, float):
+                    cell.number_format = '0.00'
+
+    def save_plot_image(self, filename):
+        if not self.have_plots:
+            return
+        try:
+            current_size = self.fig.get_size_inches()
+            current_dpi = self.fig.get_dpi()
+            self.fig.set_size_inches(14, 8)
+            self.fig.set_dpi(300)
+            path = os.path.join(self.save_folder.get(), filename)
+            self.fig.savefig(path, bbox_inches='tight')
+            self.fig.set_size_inches(current_size)
+            self.fig.set_dpi(current_dpi)
+            self.canvas.draw()
+            self.log(f"График сохранён: {path}")
+        except Exception as e:
+            self.log(f"Ошибка сохранения графика: {e}")
+
+    # plot_harmonics, plot_combined для preview
+    def plot_harmonics(self, harm_rms, ylabel, unit):
+        self.ax1.clear()
+        self.ax2.clear()
+        h_list = sorted(harm_rms.keys())
+        vals = [harm_rms[h] for h in h_list]
+        bars = self.ax2.bar(h_list, vals, color='steelblue')
+        self.ax2.set_xlabel("Номер гармоники")
+        self.ax2.set_ylabel(f"{ylabel}, {unit}")
+        self.ax2.set_title("Спектр гармоник")
+        self.ax2.grid(True, alpha=0.3)
+        for bar, val in zip(bars, vals):
+            height = bar.get_height()
+            self.ax2.text(bar.get_x() + bar.get_width()/2., height,
+                          f'{val:.2f}', ha='center', va='bottom', fontsize=8, rotation=90)
+        self.canvas.draw()
+
+    def plot_combined(self, v_harm, i_harm):
+        self.ax1.clear()
+        self.ax2.clear()
+        h_list = sorted(v_harm.keys())
+        v_vals = [v_harm[h] for h in h_list]
+        i_vals = [i_harm[h] for h in h_list]
+        bar_v = self.ax2.bar(np.array(h_list)-0.2, v_vals, 0.4, label='U, В', color='coral')
+        bar_i = self.ax2.bar(np.array(h_list)+0.2, i_vals, 0.4, label='I, А', color='teal')
+        self.ax2.set_xlabel("Номер гармоники")
+        self.ax2.set_title("Гармоники U и I")
+        self.ax2.legend()
+        self.ax2.grid(True, alpha=0.3)
+        for bars in [bar_v, bar_i]:
+            for bar in bars:
+                height = bar.get_height()
+                self.ax2.text(bar.get_x() + bar.get_width()/2., height,
+                              f'{height:.2f}', ha='center', va='bottom', fontsize=6, rotation=90)
+        self.canvas.draw()
 
 
 if __name__ == "__main__":
