@@ -315,7 +315,7 @@ class HarmonicsApp:
 
         self.settings = {
             'scale_voltage': 1.0,
-            'scale_current': 1.0,
+            'scale_current': 1694.0,
             'nominal_voltage': 230.0,
             'rms_tolerance': 3.0
         }
@@ -572,6 +572,7 @@ class HarmonicsApp:
         elif mode == "Только ток":
             if not current_signals:
                 raise ValueError("Не выбраны каналы тока")
+            self.analyze_current_only(current_signals, tInc)
             results = {}
             for idx, sig in enumerate(current_signals):
                 res = self.process_signal(sig, tInc, 'current')
@@ -630,6 +631,61 @@ class HarmonicsApp:
             'ch_names': ch_names,
             'assignments': assignments
         }))
+
+    def analyze_current_only(self, current_signals, tInc):
+        long_analysis = self.long_analysis_var.get()
+        channels = []
+        for idx, sig in enumerate(current_signals):
+            # Удаление постоянной составляющей
+            sig_ac = sig - np.mean(sig)
+            f0 = estimate_frequency(sig_ac, tInc)
+            harmonics = get_harmonic_amplitudes(sig_ac, tInc, f0)
+            rms_harm = compute_harmonic_rms(harmonics)
+            Irms = np.sqrt(np.mean(sig_ac**2))
+            I1_rms = rms_harm.get(1, 0)
+            thdi = calculate_thd(rms_harm, I1_rms) if I1_rms else 0.0
+            I1_peak = harmonics.get(1, (0,))[0]
+            Imax_inst = np.max(sig_ac)
+            Imin_inst = np.min(sig_ac)
+            Ipeak = np.max(np.abs(sig_ac))
+            crest = Ipeak / Irms if Irms != 0 else 0.0
+            times_period, rms_periods = compute_period_rms(sig_ac, tInc, f0)
+            max_rms_period = np.max(rms_periods) if len(rms_periods) > 0 else Irms
+            min_rms_period = np.min(rms_periods) if len(rms_periods) > 0 else Irms
+            avg_rms_period = np.mean(rms_periods) if len(rms_periods) > 0 else Irms
+            channels.append({
+                'name': f'I{idx+1}',
+                'signal': sig_ac,
+                'f0': f0,
+                'stats': {
+                    'Irms': Irms,
+                    'I1_rms': I1_rms,
+                    'I1_peak': I1_peak,
+                    'THDi': thdi,
+                    'Imax_inst': Imax_inst,
+                    'Imin_inst': Imin_inst,
+                    'Ipeak': Ipeak,
+                    'crest_factor': crest,
+                    'rms_periods': rms_periods,
+                    'times_period': times_period,
+                    'max_rms_period': max_rms_period,
+                    'min_rms_period': min_rms_period,
+                    'avg_rms_period': avg_rms_period,
+                    'tInc': tInc,
+                    'N_samples': len(sig_ac)
+                },
+                'harmonics': harmonics,
+                'rms_harm': rms_harm,
+                'thdi': thdi,
+                'f0': f0,
+                'tInc': tInc
+            })
+        self.result_queue.put(("current_results_extended", {
+            'channels': channels,
+            'long_analysis': long_analysis,
+            'tInc': tInc
+        }))
+
 
     def analyze_three_phase(self, paths):
         # Существующий трёхфазный анализ оставляем как есть
@@ -710,12 +766,12 @@ class HarmonicsApp:
                     self.log("Анализ завершён.")
                 elif msg[0] == "voltage_results_extended":
                     self.handle_extended_voltage_results(msg[1])
-                elif msg[0] == "current_results":
-                    self.display_current_results(msg[1])
                 elif msg[0] == "combined_results":
                     self.display_combined_results(msg[1])
                 elif msg[0] == "three_phase_results":
                     self.display_three_phase_results(msg[1])
+                elif msg[0] == "current_results_extended":
+                    self.handle_extended_current_results(msg[1])
         except queue.Empty:
             pass
         self.root.after(100, self.check_queue)
@@ -747,6 +803,22 @@ class HarmonicsApp:
         report = self.build_text_report(data)
         self.log(report)
         self.save_text_report(report, "Отчет_напряжение.txt")
+
+    def handle_extended_current_results(self, data):
+        channels = data['channels']
+        long_analysis = data['long_analysis']
+        tInc = data['tInc']
+
+        self.log("=== Расширенный анализ тока ===")
+        for ch in channels:
+            self.log(f"Канал {ch['name']}: f0={ch['f0']:.3f} Гц, Irms={ch['stats']['Irms']:.2f} А, THDi={ch['thdi']:.2f}%")
+
+        if HAVE_MPL:
+            self.generate_extended_current_plots(data)
+        if HAVE_DOCX:
+            self.generate_extended_current_word(data)
+        if HAVE_OPENPYXL:
+            self.generate_extended_current_excel(data)
 
     def build_text_report(self, data):
         phases = data['phases']
@@ -1105,6 +1177,141 @@ class HarmonicsApp:
                 self._add_paragraph_word(doc, os.path.basename(fname))
 
         self._save_word(doc, "Отчет_напряжение_расширенный.docx")
+
+    def generate_extended_current_word(self, data):
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn as docx_qn
+        channels = data['channels']
+        long_analysis = data['long_analysis']
+        tInc = data['tInc']
+
+        for ch in channels:
+            doc = self._setup_word_document()
+            # Убираем режим совместимости
+            settings = doc.settings.element
+            for child in settings:
+                if child.tag == docx_qn('w:compat'):
+                    settings.remove(child)
+                    break
+
+            self._add_heading_word(doc, "Отчёт по току")
+            self._add_paragraph_word(doc, "")
+
+            # Общие сведения
+            self._add_heading_word(doc, "Общие сведения", level=2)
+            self._add_paragraph_word(doc, f"Дата и время анализа: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+            self._add_paragraph_word(doc, f"Основная частота: {ch['f0']:.3f} Гц")
+            self._add_paragraph_word(doc, f"Частота дискретизации: {1.0/ch['tInc']:.2f} Гц")
+            self._add_paragraph_word(doc, f"Количество отсчётов: {ch['stats']['N_samples']}")
+            duration = ch['stats']['N_samples'] * ch['tInc']
+            self._add_paragraph_word(doc, f"Длительность сигнала: {duration:.3f} с")
+            self._add_paragraph_word(doc, f"Коэффициент масштабирования тока: {self.settings['scale_current']:.3f}")
+
+            # Параметры измерений
+            self._add_heading_word(doc, "Параметры измерений", level=2)
+            table1 = doc.add_table(rows=1, cols=2)
+            table1.style = 'Table Grid'
+            table1.alignment = WD_TABLE_ALIGNMENT.CENTER
+            hdr_cells = table1.rows[0].cells
+            hdr_cells[0].text = "Параметр"
+            hdr_cells[1].text = "Значение"
+            for cell in hdr_cells:
+                for p in cell.paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in p.runs:
+                        run.font.name = 'Times New Roman'
+                        run.font.size = Pt(10)
+                        run.font.color.rgb = RGBColor(0, 0, 0)
+
+            s = ch['stats']
+            rows_data = [
+                ("Действующее значение тока Irms", f"{s['Irms']:.3f} А"),
+                ("Амплитуда основной гармоники", f"{s['I1_peak']:.3f} А (пик) / {s['I1_rms']:.3f} А (RMS)"),
+                ("THDI", f"{s['THDi']:.2f} %"),
+                ("Максимальный мгновенный ток", f"{s['Imax_inst']:.3f} А"),
+                ("Минимальный мгновенный ток", f"{s['Imin_inst']:.3f} А"),
+                ("Пиковый ток", f"{s['Ipeak']:.3f} А"),
+                ("Коэффициент амплитуды тока (peak/RMS)", f"{s['crest_factor']:.3f}"),
+                ("Анализ по периодам (целых периодов: {})".format(len(s['rms_periods'])), str(len(s['rms_periods']))),
+                ("Макс. RMS за период", f"{s['max_rms_period']:.3f} А"),
+                ("Мин. RMS за период", f"{s['min_rms_period']:.3f} А"),
+                ("Среднее RMS за период", f"{s['avg_rms_period']:.3f} А")
+            ]
+            for label, value in rows_data:
+                row = table1.add_row().cells
+                row[0].text = label
+                row[1].text = value
+                for cell in row:
+                    for p in cell.paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        for run in p.runs:
+                            run.font.name = 'Times New Roman'
+                            run.font.size = Pt(10)
+                            run.font.color.rgb = RGBColor(0, 0, 0)
+            self._format_table(table1)
+
+            # Таблица 2. Гармоники тока
+            self._add_heading_word(doc, "Таблица 2. Гармоники тока (1..40)", level=2)
+            table2 = doc.add_table(rows=1, cols=5)
+            table2.style = 'Table Grid'
+            table2.alignment = WD_TABLE_ALIGNMENT.CENTER
+            headers2 = ["№", "Частота, Гц", "Амплитуда, А", "Отн. ампл., %", "Фаза, °"]
+            for i, h in enumerate(headers2):
+                cell = table2.rows[0].cells[i]
+                cell.text = h
+                for p in cell.paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in p.runs:
+                        run.font.name = 'Times New Roman'
+                        run.font.size = Pt(10)
+                        run.font.color.rgb = RGBColor(0, 0, 0)
+
+            I1_rms = s['I1_rms']
+            for h in range(1, 41):
+                freq = h * ch['f0']
+                amp_peak, comp = ch['harmonics'].get(h, (0, 0))
+                amp_rms = amp_peak / np.sqrt(2)
+                rel = (amp_rms / I1_rms * 100) if I1_rms != 0 else 0
+                phase = np.angle(comp, deg=True) if comp != 0 else 0
+                row = table2.add_row().cells
+                row[0].text = str(h)
+                row[1].text = f"{freq:.2f}"
+                row[2].text = f"{amp_rms:.4f}"
+                row[3].text = f"{rel:.2f}"
+                row[4].text = f"{phase:.1f}"
+                for cell in row:
+                    for p in cell.paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        for run in p.runs:
+                            run.font.name = 'Times New Roman'
+                            run.font.size = Pt(10)
+                            run.font.color.rgb = RGBColor(0, 0, 0)
+            self._format_table(table2)
+
+            # Вставка графиков
+            self._add_heading_word(doc, "Графики", level=2)
+            plot_files = [
+                f"RMS_тока_периоды_{ch['name']}.png",
+                f"Сигнал_тока_{ch['name']}.png",
+                f"Гармоники_тока_1-40_{ch['name']}.png",
+                f"Гармоники_тока_2-40_{ch['name']}.png",
+                f"THDi_диаграмма_{ch['name']}.png",
+                f"Спектр_тока_{ch['name']}.png",
+                f"Общий_анализ_тока_{ch['name']}.png"
+            ]
+            for fname in plot_files:
+                fpath = os.path.join(self.save_folder.get(), fname)
+                if os.path.exists(fpath):
+                    doc.add_picture(fpath, width=Inches(5.5))
+                    self._add_paragraph_word(doc, os.path.basename(fname))
+
+            self._save_word(doc, f"Отчет_ток_{ch['name']}.docx")
+
+
+
+
+
+
     # ========== EXCEL отчёты ==========
     def generate_extended_voltage_excel(self, data):
         phases = data['phases']
@@ -1266,6 +1473,79 @@ class HarmonicsApp:
             cell.alignment = alignment
             if isinstance(val, float):
                 cell.number_format = '0.00'
+
+    def generate_extended_current_excel(self, data):
+        channels = data['channels']
+        for ch in channels:
+            wb = openpyxl.Workbook()
+            font_main = Font(name='Times New Roman', size=14)
+            align_center = Alignment(horizontal='center', vertical='center')
+
+            # Общие сведения
+            ws_info = wb.active
+            ws_info.title = "Общие сведения"
+            info = [
+                ["Параметр", "Значение"],
+                ["Дата и время анализа", datetime.now().strftime('%d.%m.%Y %H:%M:%S')],
+                ["Основная частота, Гц", ch['f0']],
+                ["Частота дискретизации, Гц", 1.0 / ch['tInc']],
+                ["Количество отсчётов", ch['stats']['N_samples']],
+                ["Длительность сигнала, с", ch['stats']['N_samples'] * ch['tInc']],
+                ["Коэффициент масштабирования тока", self.settings['scale_current']]
+            ]
+            self._write_sheet_data(ws_info, info, font_main, align_center)
+
+            # Параметры измерений
+            ws_param = wb.create_sheet("Параметры измерений")
+            s = ch['stats']
+            param_data = [
+                ["Параметр", "Значение"],
+                ["Действующее значение тока Irms, А", s['Irms']],
+                ["Амплитуда основной гармоники (пик), А", s['I1_peak']],
+                ["THDI, %", s['THDi']],
+                ["Максимальный мгновенный ток, А", s['Imax_inst']],
+                ["Минимальный мгновенный ток, А", s['Imin_inst']],
+                ["Пиковый ток, А", s['Ipeak']],
+                ["Коэффициент амплитуды тока", s['crest_factor']],
+                ["Целых периодов", len(s['rms_periods'])],
+                ["Макс. RMS за период, А", s['max_rms_period']],
+                ["Мин. RMS за период, А", s['min_rms_period']],
+                ["Среднее RMS за период, А", s['avg_rms_period']]
+            ]
+            self._write_sheet_data(ws_param, param_data, font_main, align_center)
+
+            # Гармоники тока
+            ws_harm = wb.create_sheet("Гармоники тока")
+            headers = ["№", "Частота, Гц", "Амплитуда, А", "Отн. ампл., %", "Фаза, °"]
+            self._write_excel_row(ws_harm, 1, headers, font_main, align_center)
+            I1_rms = s['I1_rms']
+            for h in range(1, 41):
+                freq = h * ch['f0']
+                amp_peak, comp = ch['harmonics'].get(h, (0, 0))
+                amp_rms = amp_peak / np.sqrt(2)
+                rel = (amp_rms / I1_rms * 100) if I1_rms else 0
+                phase = np.angle(comp, deg=True)
+                self._write_excel_row(ws_harm, h + 1, [h, freq, amp_rms, rel, phase], font_main, align_center)
+
+            # Автоширина столбцов
+            for ws in [ws_info, ws_param, ws_harm]:
+                for col in ws.columns:
+                    max_len = 0
+                    col_letter = col[0].column_letter
+                    for cell in col:
+                        try:
+                            if cell.value:
+                                max_len = max(max_len, len(str(cell.value)))
+                        except:
+                            pass
+                    ws.column_dimensions[col_letter].width = min(max_len + 2, 35)
+
+            path = os.path.join(self.save_folder.get(), f"Отчет_ток_{ch['name']}.xlsx")
+            wb.save(path)
+            self.log(f"Excel отчёт по току сохранён: {path}")
+
+
+
 
     # ========== ГРАФИКИ (фото) ==========
     def generate_extended_voltage_plots(self, data):
@@ -1498,6 +1778,200 @@ class HarmonicsApp:
         path = os.path.join(self.save_folder.get(), filename)
         fig.savefig(path, bbox_inches='tight')
         self.log(f"График сохранён: {path}")
+
+    def generate_extended_current_plots(self, data):
+        channels = data['channels']
+        long_analysis = data['long_analysis']
+        for ch in channels:
+            self._plot_current_rms_periods(ch, long_analysis)
+            self._plot_current_signal(ch)
+            self._plot_current_harmonics(ch, 1, 40)
+            self._plot_current_harmonics(ch, 2, 40)
+            self._plot_current_thdi_pie(ch)
+            self._plot_current_spectrum(ch)
+            self._plot_current_combined(ch)
+
+    def _plot_current_rms_periods(self, ch, long_analysis):
+        times = ch['stats']['times_period']
+        rms_vals = ch['stats']['rms_periods']
+        if len(times) < 2:
+            return
+        fig = Figure(figsize=(14, 8), dpi=300)
+        ax = fig.add_subplot(111)
+        ax.plot(times, rms_vals, 'b-o', markersize=4)
+
+        # Автоматический запас для подписей
+        y_min, y_max = np.min(rms_vals), np.max(rms_vals)
+        y_range = y_max - y_min if y_max > y_min else 1
+        ax.set_ylim(y_min - 0.1 * y_range, y_max + 0.15 * y_range)
+
+        if not long_analysis and len(rms_vals) <= 20:
+            for t, val in zip(times, rms_vals):
+                ax.text(t, val + 0.03 * y_range, f"{val:.2f}", ha='center', fontsize=6)
+        else:
+            min_v, max_v, mean_v = y_min, y_max, np.mean(rms_vals)
+            stats_text = f"min: {min_v:.2f} А\nmax: {max_v:.2f} А\nmean: {mean_v:.2f} А"
+            props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+                    verticalalignment='top', bbox=props)
+
+        ax.set_xlabel("Время, с")
+        ax.set_ylabel("RMS, А")
+        ax.set_title(f"RMS тока по периодам - {ch['name']}")
+        ax.grid(True)
+        self._save_figure(fig, f"RMS_тока_периоды_{ch['name']}.png")
+
+    def _plot_current_signal(self, ch):
+        fig = Figure(figsize=(14, 8), dpi=300)
+        ax = fig.add_subplot(111)
+        t = np.arange(len(ch['signal'])) * ch['tInc']
+        ax.plot(t, ch['signal'], 'b')
+        ax.set_xlabel("Время, с")
+        ax.set_ylabel("Ток, А")
+        ax.set_title(f"Исходный сигнал тока (DC удалён) - {ch['name']}")
+        ax.grid(True)
+        self._save_figure(fig, f"Сигнал_тока_{ch['name']}.png")
+
+    def _plot_current_harmonics(self, ch, start, end):
+        fig = Figure(figsize=(14, 8), dpi=300)
+        ax = fig.add_subplot(111)
+        h_list = list(range(start, end + 1))
+        I1_rms = ch['stats']['I1_rms']
+        rels = []
+        for h in h_list:
+            amp_peak, _ = ch['harmonics'].get(h, (0, 0))
+            amp_rms = amp_peak / np.sqrt(2)
+            rel = (amp_rms / I1_rms * 100) if I1_rms else 0
+            rels.append(rel)
+        bars = ax.bar(h_list, rels, color='steelblue')
+        ax.set_xlabel("Номер гармоники")
+        ax.set_ylabel("Относительная амплитуда, %")
+        ax.set_title(f"Гармоники тока {start}-{end} - {ch['name']}")
+        ax.grid(True)
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2., h, f'{h:.2f}', ha='center', va='bottom', fontsize=7)
+        self._save_figure(fig, f"Гармоники_тока_{start}-{end}_{ch['name']}.png")
+
+    def _plot_current_thdi_pie(self, ch):
+        fig = Figure(figsize=(12, 10), dpi=300)
+        ax = fig.add_subplot(111)
+        squares = []
+        labels = []
+        for h in range(2, 41):
+            amp_peak, _ = ch['harmonics'].get(h, (0, 0))
+            amp_rms = amp_peak / np.sqrt(2)
+            if amp_rms > 0:
+                squares.append(amp_rms ** 2)
+                labels.append(str(h))
+        total_sq = sum(squares)
+        if total_sq == 0:
+            ax.text(0.5, 0.5, 'THDi = 0%', transform=ax.transAxes, ha='center')
+            ax.axis('off')
+        else:
+            percentages = [s / total_sq * 100 for s in squares]
+            wedges, texts, autotexts = ax.pie(
+                percentages, labels=None, autopct='%1.1f%%',
+                startangle=90, pctdistance=0.85,
+                textprops={'fontsize': 8}
+            )
+            # Выносим номера гармоник за пределы диаграммы
+            for i, (wedge, label) in enumerate(zip(wedges, labels)):
+                ang = (wedge.theta2 - wedge.theta1) / 2. + wedge.theta1
+                x = 1.2 * np.cos(np.deg2rad(ang))
+                y = 1.2 * np.sin(np.deg2rad(ang))
+                ax.text(x, y, label, ha='center', va='center', fontsize=9)
+            ax.set_title(f"Вклад гармоник в THDi - {ch['name']}")
+        self._save_figure(fig, f"THDi_диаграмма_{ch['name']}.png")
+
+    def _plot_current_spectrum(self, ch):
+        fig = Figure(figsize=(14, 8), dpi=300)
+        ax = fig.add_subplot(111)
+        sig = ch['signal']
+        N = len(sig)
+        window = np.hanning(N)
+        y = sig * window
+        Y = rfft(y)
+        freqs = rfftfreq(N, ch['tInc'])
+        ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
+        ax.set_xlim(0, 2000)
+        ax.set_xlabel("Частота, Гц")
+        ax.set_ylabel("Амплитуда")
+        ax.set_title(f"Амплитудный спектр тока - {ch['name']}")
+        ax.grid(True)
+        self._save_figure(fig, f"Спектр_тока_{ch['name']}.png")
+
+    def _plot_current_combined(self, ch):
+        fig = Figure(figsize=(20, 12), dpi=300)
+        axs = fig.subplots(2, 2)
+
+        # Сигнал
+        ax = axs[0, 0]
+        t = np.arange(len(ch['signal'])) * ch['tInc']
+        ax.plot(t, ch['signal'], 'b')
+        ax.set_title("Сигнал тока (DC удалён)")
+        ax.grid(True)
+
+        # RMS по периодам
+        ax = axs[0, 1]
+        times = ch['stats']['times_period']
+        rms_vals = ch['stats']['rms_periods']
+        if len(times) >= 2:
+            ax.plot(times, rms_vals, 'b-o', markersize=3)
+            y_min, y_max = np.min(rms_vals), np.max(rms_vals)
+            y_range = y_max - y_min if y_max > y_min else 1
+            ax.set_ylim(y_min - 0.1 * y_range, y_max + 0.15 * y_range)
+            ax.set_title("RMS по периодам")
+            ax.grid(True)
+        else:
+            ax.text(0.5, 0.5, "Нет данных", transform=ax.transAxes, ha='center')
+
+        # Круговая диаграмма THDi
+        ax = axs[1, 0]
+        squares = []
+        labels = []
+        for h in range(2, 41):
+            amp_peak, _ = ch['harmonics'].get(h, (0, 0))
+            amp_rms = amp_peak / np.sqrt(2)
+            if amp_rms > 0:
+                squares.append(amp_rms ** 2)
+                labels.append(str(h))
+        total_sq = sum(squares)
+        if total_sq > 0:
+            percentages = [s / total_sq * 100 for s in squares]
+            wedges, texts, autotexts = ax.pie(
+                percentages, labels=None, autopct='%1.1f%%',
+                startangle=90, pctdistance=0.85,
+                textprops={'fontsize': 6}
+            )
+            for i, (wedge, label) in enumerate(zip(wedges, labels)):
+                ang = (wedge.theta2 - wedge.theta1) / 2. + wedge.theta1
+                x = 1.25 * np.cos(np.deg2rad(ang))
+                y = 1.25 * np.sin(np.deg2rad(ang))
+                ax.text(x, y, label, ha='center', va='center', fontsize=7)
+            ax.set_title("Вклад гармоник в THDi")
+        else:
+            ax.text(0.5, 0.5, "THDi = 0%", transform=ax.transAxes, ha='center')
+            ax.axis('off')
+
+        # Спектр
+        ax = axs[1, 1]
+        sig = ch['signal']
+        N = len(sig)
+        window = np.hanning(N)
+        Y = rfft(sig * window)
+        freqs = rfftfreq(N, ch['tInc'])
+        ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
+        ax.set_xlim(0, 2000)
+        ax.set_title("Амплитудный спектр")
+        ax.grid(True)
+
+        fig.tight_layout()
+        self._save_figure(fig, f"Общий_анализ_тока_{ch['name']}.png")
+
+
+
 
     # -------------------- Обработчики других режимов (оставлены для совместимости) --------------------
     def display_current_results(self, results):
