@@ -202,23 +202,39 @@ def calculate_thd(harmonic_rms, fundamental_rms):
     return np.sqrt(sum_sq) / fundamental_rms * 100
 
 def power_from_spectra(harm_v, harm_i, f0, max_harm=40):
-    P_total = 0.0; Q_total = 0.0
-    P_harm = {}; Q_harm = {}
-    for h in range(1, max_harm+1):
+    P_total = 0.0
+    Q_total = 0.0
+    P_harm = {}
+    Q_harm = {}
+    for h in range(1, max_harm + 1):
         if h not in harm_v or h not in harm_i:
             continue
-        _, Vc = harm_v[h]
-        _, Ic = harm_i[h]
-        S_complex = Vc * np.conj(Ic) / 2.0
-        P = np.real(S_complex); Q = np.imag(S_complex)
-        P_harm[h] = P; Q_harm[h] = Q
-        P_total += P; Q_total += Q
-    Vrms_total = np.sqrt(sum((amp/np.sqrt(2))**2 for amp, _ in harm_v.values()))
-    Irms_total = np.sqrt(sum((amp/np.sqrt(2))**2 for amp, _ in harm_i.values()))
+        V_peak, V_comp = harm_v[h]
+        I_peak, I_comp = harm_i[h]
+        # Восстанавливаем комплексную пиковую амплитуду, сохраняя фазу
+        V_phasor = V_peak * np.exp(1j * np.angle(V_comp))
+        I_phasor = I_peak * np.exp(1j * np.angle(I_comp))
+        S_h = V_phasor * np.conj(I_phasor) / 2.0   # мощность гармоники
+        P = np.real(S_h)
+        Q = np.imag(S_h)
+        P_harm[h] = P
+        Q_harm[h] = Q
+        P_total += P
+        Q_total += Q
+
+    # Суммарные RMS значения для полной мощности
+    Vrms_total = np.sqrt(sum((amp / np.sqrt(2)) ** 2 for amp, _ in harm_v.values()))
+    Irms_total = np.sqrt(sum((amp / np.sqrt(2)) ** 2 for amp, _ in harm_i.values()))
     S_total = Vrms_total * Irms_total
     pf = P_total / S_total if S_total != 0 else 0.0
-    return {'P_total': P_total, 'Q_total': Q_total, 'S_total': S_total,
-            'pf': pf, 'P_harm': P_harm, 'Q_harm': Q_harm}
+    return {
+        'P_total': P_total,
+        'Q_total': Q_total,
+        'S_total': S_total,
+        'pf': pf,
+        'P_harm': P_harm,
+        'Q_harm': Q_harm
+    }
 
 def check_gost_limits(voltage_rms_harm, nominal_voltage=230):
     violations = []
@@ -1624,6 +1640,7 @@ class HarmonicsApp:
             self._format_table(tbl4)
 
         # ---------- Таблица 5. Параметры измерений тока ----------
+        cur = data['current']
         self._add_heading_word(doc, "Таблица 5. Параметры измерений тока", level=2)
         tbl5 = doc.add_table(rows=1, cols=2)
         tbl5.style = 'Table Grid'
@@ -1639,7 +1656,7 @@ class HarmonicsApp:
                     run.font.size = Pt(10)
                     run.font.color.rgb = RGBColor(0,0,0)
 
-        s_i = i['stats']
+        s_i = cur['stats']
         rows_i = [
             ("Действующее значение тока Irms", f"{s_i['Irms']:.3f} А"),
             ("Амплитуда основной гармоники", f"{s_i['I1_peak']:.3f} А (пик) / {s_i['I1_rms']:.3f} А (RMS)"),
@@ -1684,8 +1701,8 @@ class HarmonicsApp:
 
         I1_rms = s_i['I1_rms']
         for h in range(1, 41):
-            freq = h * i['f0']
-            amp_peak, comp = i['harmonics'].get(h, (0, 0))
+            freq = h * cur['f0']
+            amp_peak, comp = cur['harmonics'].get(h, (0, 0))
             amp_rms = amp_peak / np.sqrt(2)
             rel = (amp_rms / I1_rms * 100) if I1_rms != 0 else 0
             phase = np.angle(comp, deg=True) if comp != 0 else 0
@@ -1723,11 +1740,11 @@ class HarmonicsApp:
             ("Активная мощность P", f"{data['power']['P_total']:.2f} Вт"),
             ("Реактивная мощность Q", f"{data['power']['Q_total']:.2f} вар"),
             ("Полная мощность S", f"{data['power']['S_total']:.2f} ВА"),
-            ("Коэффициент мощности (общий)", f"{data['power']['pf']:.3f}"),
+            ("Коэффициент мощности PF (общий)", f"{data['power']['pf']:.3f}"),
             ("Коэффициент мощности (50 Гц)", f"{data['pf1']:.3f}"),
             ("Сдвиг фаз основной гармоники", f"{data['phase_shift']:.1f}°"),
             ("THD", f"{v['thd']:.2f}%"),
-            ("THDi", f"{i['thdi']:.2f}%"),
+            ("THDi", f"{cur['thdi']:.2f}%"),
         ]
         for label, val in pow_data:
             row = tbl7.add_row().cells
@@ -1745,14 +1762,14 @@ class HarmonicsApp:
         # Графики
         self._add_heading_word(doc, "Графики", level=2)
         plot_files = [
-            "power_factor_harmonics.png",
-            "power_pie.png",
-            "U_I_relative_amplitudes.png",
-            "U_I_signal.png",
-            "spectrum_U.png",
-            "spectrum_I.png",
-            "vector_diagram.png",
-            "combined_U_I_overview.png"
+            "Коэффициент_мощности_по_гармоникам.png",
+            "Круговая_диаграмма_мощности.png",
+            "Относительные_амплитуды_U_I.png",
+            "Сигнал_напряжения_и_тока.png",
+            "Спектр_напряжения.png",
+            "Спектр_тока.png",
+            "Векторная_диаграмма.png",
+            "Общий_анализ_напряжения_и_тока.png"
         ]
         for fname in plot_files:
             fpath = os.path.join(self.save_folder.get(), fname)
@@ -2263,7 +2280,11 @@ class HarmonicsApp:
         Y = rfft(y)
         freqs = rfftfreq(N, tInc)
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
-        ax.set_xlim(0, 2000)
+        ax.set_xlim(60, 2000)
+        mask = (freqs >= 60) & (freqs <= 2000)
+        if np.any(mask):
+            y_max = np.max(np.abs(Y[mask]))
+        ax.set_ylim(0, y_max * 1.1)
         ax.set_xlabel("Частота, Гц")
         ax.set_ylabel("Амплитуда")
         ax.set_title(title)
@@ -2276,20 +2297,29 @@ class HarmonicsApp:
         if 1 in data['voltage']['harmonics'] and 1 in data['current']['harmonics']:
             _, Vc = data['voltage']['harmonics'][1]
             _, Ic = data['current']['harmonics'][1]
-            V_phasor = Vc / np.sqrt(2)
-            I_phasor = Ic / np.sqrt(2)
-            ax.arrow(0, 0, np.real(V_phasor), np.imag(V_phasor), color='red', width=0.5, label='U')
-            ax.arrow(0, 0, np.real(I_phasor), np.imag(I_phasor), color='blue', width=0.5, label='I')
+            angle_v = np.angle(Vc)
+            angle_i = np.angle(Ic)
+            # Единичные векторы
+            ax.arrow(0, 0, np.cos(angle_v), np.sin(angle_v),
+                    color='red', width=0.015, head_width=0.08, length_includes_head=True, label='Напряжение U')
+            ax.arrow(0, 0, np.cos(angle_i), np.sin(angle_i),
+                    color='blue', width=0.015, head_width=0.08, length_includes_head=True, label='Ток I')
+            ax.set_xlim(-1.3, 1.3)
+            ax.set_ylim(-1.3, 1.3)
+            ax.set_aspect('equal')
             ax.set_xlabel("Действительная ось")
             ax.set_ylabel("Мнимая ось")
-            ax.set_title("Векторная диаграмма основной гармоники")
-            ax.legend()
-            ax.axis('equal')
+            ax.set_title("Векторная диаграмма основной гармоники (нормировано)")
+            ax.legend(loc='upper right')
             ax.grid(True)
+            # Подпись угла
+            phi = data.get('phase_shift', 0.0)   # уже вычислен в analyse_voltage_current
+            ax.text(0.05, 0.95, f'φ = {phi:.1f}°', transform=ax.transAxes,
+                    fontsize=12, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         else:
             ax.text(0.5, 0.5, "Нет данных", transform=ax.transAxes, ha='center')
             ax.axis('off')
-        self._save_figure(fig, "vector_diagram.png")
+        self._save_figure(fig, "Векторная_диаграмма.png")
 
     def _plot_combined_ui_overview(self, data):
         fig = Figure(figsize=(20, 12), dpi=300)
@@ -2310,7 +2340,11 @@ class HarmonicsApp:
         Y = rfft(sig_u * win)
         freqs = rfftfreq(N, data['tInc'])
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
-        ax.set_xlim(0, 2000)
+        ax.set_xlim(60, 2000)
+        mask = (freqs >= 60) & (freqs <= 2000)
+        if np.any(mask):
+            y_max = np.max(np.abs(Y[mask]))
+        ax.set_ylim(0, y_max * 1.1)
         ax.set_title("Спектр U")
 
         # 3. Спектр I
@@ -2320,7 +2354,11 @@ class HarmonicsApp:
         Y = rfft(sig_i * win)
         freqs = rfftfreq(N, data['tInc'])
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
-        ax.set_xlim(0, 2000)
+        ax.set_xlim(60, 2000)
+        mask = (freqs >= 60) & (freqs <= 2000)
+        if np.any(mask):
+            y_max = np.max(np.abs(Y[mask]))
+        ax.set_ylim(0, y_max * 1.1)
         ax.set_title("Спектр I")
 
         # 4. Коэффициент мощности по гармоникам
@@ -2481,7 +2519,11 @@ class HarmonicsApp:
         Y = rfft(y)
         freqs = rfftfreq(N, tInc)
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
-        ax.set_xlim(0, 2000)  # до 2 кГц
+        ax.set_xlim(60, 2000)  # до 2 кГц
+        mask = (freqs >= 60) & (freqs <= 2000)
+        if np.any(mask):
+            y_max = np.max(np.abs(Y[mask]))
+        ax.set_ylim(0, y_max * 1.1)
         ax.set_xlabel("Частота, Гц")
         ax.set_ylabel("Амплитуда")
         ax.set_title(f"Амплитудный спектр - Фаза {ph['name']}")
@@ -2783,8 +2825,8 @@ class HarmonicsApp:
         self._plot_power_pie(data)
         self._plot_ui_relative_amplitudes(data)
         self._plot_ui_signal(data)
-        self._plot_spectrum(data['voltage']['signal'], data['tInc'], "spectrum_U.png", "Спектр напряжения")
-        self._plot_spectrum(data['current']['signal'], data['tInc'], "spectrum_I.png", "Спектр тока")
+        self._plot_spectrum(data['voltage']['signal'], data['tInc'], "Спектр_напряжения.png", "Спектр напряжения")
+        self._plot_spectrum(data['current']['signal'], data['tInc'], "Спектр_тока.png", "Спектр тока")
         self._plot_vector_diagram(data)
         self._plot_combined_ui_overview(data)
 
@@ -2807,13 +2849,16 @@ class HarmonicsApp:
         ax.set_ylabel("Коэффициент мощности")
         ax.set_title("Коэффициент мощности по гармоникам")
         ax.grid(True)
-        self._save_figure(fig, "power_factor_harmonics.png")
+        self._save_figure(fig, "Коэффициент_мощности_по_гармоникам.png")
 
     def _plot_power_pie(self, data):
         fig = Figure(figsize=(10, 10), dpi=300)
         ax = fig.add_subplot(111)
         P = abs(data['power']['P_total'])
         Q = abs(data['power']['Q_total'])
+        S = data['power']['S_total']
+        pf = data['power']['pf']
+        
         if P == 0 and Q == 0:
             ax.text(0.5, 0.5, "S = 0", transform=ax.transAxes, ha='center')
             ax.axis('off')
@@ -2822,7 +2867,12 @@ class HarmonicsApp:
             sizes = [P, Q]
             ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
             ax.set_title("Составляющие полной мощности")
-        self._save_figure(fig, "power_pie.png")
+            # Добавляем текстовый блок со значениями
+            textstr = f'P = {P:.2f} Вт\nQ = {Q:.2f} вар\nS = {S:.2f} ВА\ncos φ = {pf:.3f}'
+            props = dict(boxstyle='round', facecolor='lightgoldenrodyellow', alpha=0.7)
+            ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=12,
+                    verticalalignment='top', bbox=props)
+        self._save_figure(fig, "Круговая_диаграмма_мощности.png")
 
     def _plot_ui_relative_amplitudes(self, data):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -2843,7 +2893,7 @@ class HarmonicsApp:
         ax.set_title("Относительные амплитуды гармоник U и I (без 1-й)")
         ax.legend()
         ax.grid(True)
-        self._save_figure(fig, "U_I_relative_amplitudes.png")
+        self._save_figure(fig, "Относительные_амплитуды_U_I.png")
 
     def _plot_ui_signal(self, data):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -2856,7 +2906,7 @@ class HarmonicsApp:
         ax.set_title("Напряжение и ток фазы")
         ax.legend()
         ax.grid(True)
-        self._save_figure(fig, "U_I_signal.png")
+        self._save_figure(fig, "Сигнал_напряжения_и_тока.png")
 
     def _plot_spectrum(self, signal, tInc, filename, title):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -2867,7 +2917,11 @@ class HarmonicsApp:
         Y = rfft(y)
         freqs = rfftfreq(N, tInc)
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
-        ax.set_xlim(0, 2000)
+        ax.set_xlim(60, 2000)
+        mask = (freqs >= 60) & (freqs <= 2000)
+        if np.any(mask):
+            y_max = np.max(np.abs(Y[mask]))
+        ax.set_ylim(0, y_max * 1.1)
         ax.set_xlabel("Частота, Гц")
         ax.set_ylabel("Амплитуда")
         ax.set_title(title)
@@ -2891,10 +2945,14 @@ class HarmonicsApp:
             ax.legend()
             ax.axis('equal')
             ax.grid(True)
+            phi = data.get('phase_shift', 0.0)
+            ax.text(0.05, 0.95, f'φ = {phi:.1f}°', transform=ax.transAxes,
+                    fontsize=12, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         else:
             ax.text(0.5, 0.5, "Нет данных", transform=ax.transAxes, ha='center')
             ax.axis('off')
-        self._save_figure(fig, "vector_diagram.png")
+        self._save_figure(fig, "Векторная_диаграмма.png")
 
     def _plot_combined_ui_overview(self, data):
         fig = Figure(figsize=(20, 12), dpi=300)
@@ -2916,7 +2974,11 @@ class HarmonicsApp:
         Y = rfft(sig_u * win)
         freqs = rfftfreq(N, data['tInc'])
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
-        ax.set_xlim(0, 2000)
+        ax.set_xlim(60, 2000)
+        mask = (freqs >= 60) & (freqs <= 2000)
+        if np.any(mask):
+            y_max = np.max(np.abs(Y[mask]))
+        ax.set_ylim(0, y_max * 1.1)
         ax.set_title("Спектр U")
 
         # 3. Спектр I
@@ -2926,7 +2988,7 @@ class HarmonicsApp:
         Y = rfft(sig_i * win)
         freqs = rfftfreq(N, data['tInc'])
         ax.stem(freqs, np.abs(Y), markerfmt=' ', basefmt=' ')
-        ax.set_xlim(0, 2000)
+        ax.set_xlim(60, 2000)
         ax.set_title("Спектр I")
 
         # 4. Коэффициент мощности по гармоникам
@@ -2959,7 +3021,7 @@ class HarmonicsApp:
         # Пустой subplot (можно убрать)
         fig.delaxes(axs[1,2])
         fig.tight_layout()
-        self._save_figure(fig, "combined_U_I_overview.png")
+        self._save_figure(fig, "Общий_анализ_напряжения_и_тока.png")
 
 
     # -------------------- Обработчики других режимов (оставлены для совместимости) --------------------
