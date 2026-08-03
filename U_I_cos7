@@ -54,6 +54,22 @@ try:
 except ImportError:
     HAVE_OPENPYXL = False
 
+def fmt_num(n):
+    """Преобразует число в строку с пробелами между разрядами тысяч."""
+    if n is None:
+        return ""
+    try:
+        # Для целых чисел – без десятичной части
+        if isinstance(n, int):
+            return f"{n:,}".replace(",", " ")
+        # Для чисел с плавающей точкой – оставляем два знака (можно менять)
+        elif isinstance(n, float):
+            return f"{n:,.2f}".replace(",", " ").replace(".", ",")  # если нужна запятая как разделитель дробной
+        else:
+            return str(n)
+    except:
+        return str(n)
+
 # -------------------- ГОСТ 32144-2013 (0.38 кВ) --------------------
 GOST_THD_LIMITS = {"norm": 8.0, "max": 12.0}
 GOST_FREQ_DEV_NORM = 0.2   # Гц
