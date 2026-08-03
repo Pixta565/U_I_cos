@@ -684,9 +684,9 @@ class HarmonicsApp:
 
     @staticmethod
     def _fmt(num, decimals=2):
-        """Форматирует число с пробелами между тысячами."""
+        """Форматирует число с неразрывными пробелами между тысячами."""
         try:
-            return f"{num:,.{decimals}f}".replace(",", " ")
+            return f"{num:,.{decimals}f}".replace(",", "\u202F")
         except (ValueError, TypeError):
             return str(num)
 
@@ -735,52 +735,51 @@ class HarmonicsApp:
 
 
     def _auto_scale_current_dialog(self, mode, paths):
+        """Запрашивает целевой ток для каждой фазы и рассчитывает масштаб.
+        Возвращает True, если можно продолжать анализ, False при отмене."""
         assignments = [var.get() for var in self.channel_vars]
-        self.root.update_idletasks()   # обрабатываем события перед диалогом
 
-        if "Трёхфазный" in mode:
+        if "Трёхфазный" in mode:                     # Трёхфазный объединённый (3 файла)
             scales = []
             for idx, path in enumerate(paths):
-                try:
-                    _, _, ch_names, data = parse_csv(path)
-                except Exception as e:
-                    messagebox.showerror("Ошибка чтения CSV", f"Фаза {chr(ord('А')+idx)}: {e}")
-                    return False
-                try:
-                    ток_idx = next(i for i, a in enumerate(assignments) if a == "Ток")
-                except StopIteration:
+                _, _, ch_names, data = parse_csv(path)
+                # Ищем индекс канала, назначенного как "Ток"
+                ток_idx = next((i for i, a in enumerate(assignments) if a == "Ток"), None)
+                if ток_idx is None:                  # если ток не назначен, масштаб = 1
                     scales.append(1.0)
                     continue
-                raw_rms = np.sqrt(np.mean(data[:, ток_idx]**2))
+                # RMS после удаления постоянной составляющей
+                signal_ac = data[:, ток_idx] - np.mean(data[:, ток_idx])
+                raw_rms = np.sqrt(np.mean(signal_ac**2))
                 target = self._ask_current_value(
                     raw_rms,
                     f"Действующее значение тока фазы {chr(ord('А')+idx)} (А):"
+                )
+                if target is None:                   # пользователь нажал «Отмена»
+                    return False
+                scales.append(target / raw_rms if raw_rms != 0 else 1.0)
+            self.auto_scale_current = scales
+            return True
+
+        else:                                         # однофайловые режимы
+            path = paths[0]
+            _, _, ch_names, data = parse_csv(path)
+            tok_kann = [(i, ch_names[i]) for i, a in enumerate(assignments) if a == "Ток"]
+            if not tok_kann:
+                return True
+            scales = []
+            for idx, name in tok_kann:
+                signal_ac = data[:, idx] - np.mean(data[:, idx])
+                raw_rms = np.sqrt(np.mean(signal_ac**2))
+                target = self._ask_current_value(
+                    raw_rms,
+                    f"Ток канала {name} (А):"
                 )
                 if target is None:
                     return False
                 scales.append(target / raw_rms if raw_rms != 0 else 1.0)
             self.auto_scale_current = scales
             return True
-
-        # однофайловые режимы
-        path = paths[0]
-        try:
-            _, _, ch_names, data = parse_csv(path)
-        except Exception as e:
-            messagebox.showerror("Ошибка чтения CSV", str(e))
-            return False
-        tok_kann = [(i, ch_names[i]) for i, a in enumerate(assignments) if a == "Ток"]
-        if not tok_kann:
-            return True
-        scales = []
-        for idx, name in tok_kann:
-            raw_rms = np.sqrt(np.mean(data[:, idx]**2))
-            target = self._ask_current_value(raw_rms, f"Ток канала {name} (А):")
-            if target is None:
-                return False
-            scales.append(target / raw_rms if raw_rms != 0 else 1.0)
-        self.auto_scale_current = scales
-        return True
 
     def start_analysis(self):
         self.progress['mode'] = 'determinate'
@@ -2096,9 +2095,9 @@ class HarmonicsApp:
                     run.font.size = Pt(10)
                     run.font.color.rgb = RGBColor(0,0,0)
         pow_data = [
-            ("Активная мощность P", f"{data['power']['P_total']:.2f} Вт"),
-            ("Реактивная мощность Q", f"{data['power']['Q_total']:.2f} вар"),
-            ("Полная мощность S", f"{data['power']['S_total']:.2f} ВА"),
+            ("Активная мощность P", f"{self._fmt(data['power']['P_total'])} Вт"),
+            ("Реактивная мощность Q", f"{self._fmt(data['power']['Q_total'])} вар"),
+            ("Полная мощность S", f"{self._fmt(data['power']['S_total'])} ВА"),
             ("Коэффициент мощности PF (общий)", f"{data['power']['pf']:.3f}"),
             ("Коэффициент мощности (50 Гц)", f"{data['pf1']:.3f}"),
             ("Сдвиг фаз основной гармоники", f"{data['phase_shift']:.1f}°"),
@@ -2792,7 +2791,7 @@ class HarmonicsApp:
             ["Ср. RMS пер., В", s_v['avg_rms_period']]
         ]
         for r, (label, val) in enumerate(volt_data, 2):
-            self._write_excel_row(ws_volt, r, [label, self._fmt(val, 2)], font_main, align_center)
+            self._write_excel_row(ws_volt, r, [label, val], font_main, align_center)
 
         # ---------- Лист «Гармоники напряжения» ----------
         ws_harm_v = wb.create_sheet("Гармоники напряжения")
@@ -2877,7 +2876,7 @@ class HarmonicsApp:
             ["Среднее RMS за период, А", s_i['avg_rms_period']]
         ]
         for r, (label, val) in enumerate(current_data, 2):
-            self._write_excel_row(ws_param_i, r, [label, self._fmt(val, 2)], font_main, align_center)
+            self._write_excel_row(ws_param_i, r, [label, val], font_main, align_center)
 
         # ---------- Лист «Гармоники тока» ----------
         ws_harm_i = wb.create_sheet("Гармоники тока")
@@ -2908,8 +2907,7 @@ class HarmonicsApp:
             ["THDi, %", i['thdi']],
         ]
         for r, (label, val) in enumerate(pow_rows, 2):
-            self._write_excel_row(ws_pow, r, [label, self._fmt(val, 2) if isinstance(val, float) else val],
-                                  font_main, align_center)
+            self._write_excel_row(ws_pow, r, [label, val if isinstance(val, float) else val], font_main, align_center)
 
         # Сохранение
         path = os.path.join(self.save_folder.get(), "Отчет_напряжение_ток.xlsx")
