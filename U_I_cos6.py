@@ -407,7 +407,7 @@ class HarmonicsApp:
             if main_vert.winfo_exists():
                 h = main_vert.winfo_height()
                 if h > 200:
-                    main_vert.sashpos(0, h - 400)
+                    main_vert.sashpos(0, h - 300)
 
         self.root.after(300, set_sashes)
 
