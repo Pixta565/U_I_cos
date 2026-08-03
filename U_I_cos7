@@ -54,22 +54,6 @@ try:
 except ImportError:
     HAVE_OPENPYXL = False
 
-def fmt_num(n):
-    """Преобразует число в строку с пробелами между разрядами тысяч."""
-    if n is None:
-        return ""
-    try:
-        # Для целых чисел – без десятичной части
-        if isinstance(n, int):
-            return f"{n:,}".replace(",", " ")
-        # Для чисел с плавающей точкой – оставляем два знака (можно менять)
-        elif isinstance(n, float):
-            return f"{n:,.2f}".replace(",", " ").replace(".", ",")  # если нужна запятая как разделитель дробной
-        else:
-            return str(n)
-    except:
-        return str(n)
-
 # -------------------- ГОСТ 32144-2013 (0.38 кВ) --------------------
 GOST_THD_LIMITS = {"norm": 8.0, "max": 12.0}
 GOST_FREQ_DEV_NORM = 0.2   # Гц
@@ -367,10 +351,11 @@ class HarmonicsApp:
             'scale_voltage': 1.0,
             'scale_current': 1694.0,
             'nominal_voltage': 230.0,
-            'rms_tolerance': 3.0
+            'rms_tolerance': 3.0,
+            'auto_scale_current': False
         }
         self.auto_scale_current = None   # будет хранить список или None
-        self.stop_event = threading.Event()
+        
 
         self.csv_file_paths = [tk.StringVar() for _ in range(3)]
         self.channel_vars = []
@@ -485,14 +470,11 @@ class HarmonicsApp:
         ttk.Button(btn_frame, text="Предпросмотр", command=self.preview_signal).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Настройки", command=self.open_settings).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Запуск", style='Start.TButton', command=self.start_analysis).pack(side=tk.RIGHT, padx=2)
-        #ttk.Button(btn_frame, text="Стоп", command=self.stop_analysis).pack(side=tk.RIGHT, padx=2)
-
+        
         self.progress = ttk.Progressbar(parent, mode='determinate', maximum=100)
         self.progress.pack(fill=tk.X, pady=5)
 
-    def stop_analysis(self):
-        self.stop_event.set()
-        self.log("Запрошена остановка анализа...")
+
 
     def update_file_visibility(self):
         mode = self.mode_var.get()
@@ -560,24 +542,46 @@ class HarmonicsApp:
     def open_settings(self):
         settings_win = tk.Toplevel(self.root)
         settings_win.title("Настройки")
-        settings_win.geometry("300x250")
+        settings_win.geometry("350x350")
         settings_win.resizable(False, False)
 
+        # Масштаб напряжения
         ttk.Label(settings_win, text="Масштаб напряжения:").pack(pady=2)
         v_scale = tk.StringVar(value=str(self.settings['scale_voltage']))
         ttk.Entry(settings_win, textvariable=v_scale).pack(pady=2)
 
-        ttk.Label(settings_win, text="Масштаб тока:").pack(pady=2)
-        i_scale = tk.StringVar(value=str(self.settings['scale_current']))
-        ttk.Entry(settings_win, textvariable=i_scale).pack(pady=2)
+        # Режим масштаба тока
+        ttk.Label(settings_win, text="Режим масштаба тока:").pack(pady=(10,2))
+        scale_mode = tk.StringVar(value="manual" if not self.settings.get('auto_scale_current', False) else "auto")
 
+        def on_mode_change():
+            if scale_mode.get() == "manual":
+                i_scale_entry.configure(state='normal')
+            else:
+                i_scale_entry.configure(state='disabled')
+
+        ttk.Radiobutton(settings_win, text="Ручной (введите масштаб выше)", variable=scale_mode, value="manual", command=on_mode_change).pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(settings_win, text="Автоматический (по целевому току)", variable=scale_mode, value="auto", command=on_mode_change).pack(anchor=tk.W, padx=20)
+
+        # Масштаб тока (ручной)
+        ttk.Label(settings_win, text="Масштаб тока (ручной):").pack(pady=2)
+        i_scale = tk.StringVar(value=str(self.settings['scale_current']))
+        i_scale_entry = ttk.Entry(settings_win, textvariable=i_scale)
+        i_scale_entry.pack(pady=2)
+
+        # Номинальное напряжение
         ttk.Label(settings_win, text="Номинальное напряжение (В):").pack(pady=2)
         nom_v = tk.StringVar(value=str(self.settings['nominal_voltage']))
         ttk.Entry(settings_win, textvariable=nom_v).pack(pady=2)
 
+        # Допуск RMS
         ttk.Label(settings_win, text="Допуск RMS (+- %):").pack(pady=2)
         tol = tk.StringVar(value=str(self.settings['rms_tolerance']))
         ttk.Entry(settings_win, textvariable=tol).pack(pady=2)
+
+        
+        # Применяем начальное состояние поля
+        on_mode_change()
 
         def save_settings():
             try:
@@ -585,6 +589,21 @@ class HarmonicsApp:
                 self.settings['scale_current'] = float(i_scale.get())
                 self.settings['nominal_voltage'] = float(nom_v.get())
                 self.settings['rms_tolerance'] = float(tol.get())
+                self.settings['auto_scale_current'] = (scale_mode.get() == "auto")
+            except ValueError:
+                messagebox.showerror("Ошибка", "Некорректное числовое значение")
+                return
+            settings_win.destroy()
+
+        ttk.Button(settings_win, text="Сохранить", command=save_settings).pack(pady=10)
+        
+        def save_settings():
+            try:
+                self.settings['scale_voltage'] = float(v_scale.get())
+                self.settings['scale_current'] = float(i_scale.get())
+                self.settings['nominal_voltage'] = float(nom_v.get())
+                self.settings['rms_tolerance'] = float(tol.get())
+                self.settings['auto_scale_current'] = (scale_mode.get() == "auto") 
             except ValueError:
                 messagebox.showerror("Ошибка", "Некорректное числовое значение")
                 return
@@ -662,6 +681,14 @@ class HarmonicsApp:
         preview_win.transient(self.root)
         preview_win.grab_set()
         preview_win.focus_set()
+
+    @staticmethod
+    def _fmt(num, decimals=2):
+        """Форматирует число с пробелами между тысячами."""
+        try:
+            return f"{num:,.{decimals}f}".replace(",", " ")
+        except (ValueError, TypeError):
+            return str(num)
 
     def _ask_current_value(self, default_val, prompt):
         dialog = tk.Toplevel(self.root)
@@ -759,7 +786,6 @@ class HarmonicsApp:
         self.progress['mode'] = 'determinate'
         self.progress['maximum'] = 100
         self.progress['value'] = 0 
-        self.stop_event.clear()
         mode = self.mode_var.get()
         if "Трёхфазный" in mode:
             paths = [self.csv_file_paths[i].get() for i in range(3)]
@@ -778,9 +804,13 @@ class HarmonicsApp:
         self.auto_scale_current = None   # сбрасываем перед новым анализом
 
         if mode in ["Только ток", "Напряжение и ток (одна фаза)",
-                    "Трёхфазный объединённый (3 файла)"]:
-            if not self._auto_scale_current_dialog(mode, paths):
-                return   # пользователь нажал отмену
+            "Трёхфазный объединённый (3 файла)"]:
+            if self.settings['auto_scale_current']:
+                if not self._auto_scale_current_dialog(mode, paths):
+                    return
+            else:
+                # Сбрасываем автоматический масштаб, чтобы использовались настройки
+                self.auto_scale_current = None
         self.progress.start()
         self.log("Начинаем анализ...")
         thread = threading.Thread(target=self.run_analysis, args=(mode, paths), daemon=True)
@@ -796,8 +826,6 @@ class HarmonicsApp:
                 self.analyze_single(mode, paths[0])
         except Exception as e:
             self.result_queue.put(("error", str(e)))
-        except StopIteration:
-            self.result_queue.put(("log", "Анализ остановлен."))
         
 
     def analyze_single(self, mode, path):
@@ -1369,7 +1397,7 @@ class HarmonicsApp:
             row_cells[0].text = name
             for i, val in enumerate(values):
                 cell = row_cells[i+1]
-                cell.text = f"{val:.2f}{unit}"
+                cell.text = f"{self._fmt(val, 2)}{unit}"
                 is_bold = False
                 if tol_abs is not None and abs(val) > tol_abs:
                     is_bold = True
@@ -1430,7 +1458,7 @@ class HarmonicsApp:
             row_cells[0].text = name
             for i, val in enumerate(values):
                 cell = row_cells[i+1]
-                cell.text = f"{val:.2f}{unit}"
+                cell.text = f"{self._fmt(val, 2)}{unit}"
                 if tol_check and val > tol_check:
                     for p in cell.paragraphs:
                         for run in p.runs:
@@ -2177,7 +2205,7 @@ class HarmonicsApp:
             elif "Коэф. амплитуды" in label:
                 bold_flags = [abs(v) > 1.41 for v in vals]
             for i, val in enumerate(vals):
-                row_cells[i+1].text = f"{val:.2f}"
+                row_cells[i+1].text = self._fmt(val,2)
                 fmt_cell(row_cells[i+1], bold=bold_flags[i])
             avg_val = np.mean(vals)
             row_cells[-1].text = f"{avg_val:.2f}"
@@ -2206,7 +2234,7 @@ class HarmonicsApp:
             row_cells[0].text = label
             fmt_cell(row_cells[0])
             for i, val in enumerate(vals):
-                row_cells[i+1].text = f"{val:.2f}"
+                row_cells[i+1].text = self._fmt(val,2)
                 fmt_cell(row_cells[i+1])
             row_cells[-1].text = f"{np.mean(vals):.2f}"
             fmt_cell(row_cells[-1])
@@ -2217,7 +2245,7 @@ class HarmonicsApp:
         row_cells[0].text = "Ku (THD), % (≤8%)"
         fmt_cell(row_cells[0])
         for i, val in enumerate(ku_vals):
-            row_cells[i+1].text = f"{val:.2f}"
+            row_cells[i+1].text = self._fmt(val,2)
             fmt_cell(row_cells[i+1], bold=(val > 8.0))
         row_cells[-1].text = f"{np.mean(ku_vals):.2f}"
         fmt_cell(row_cells[-1], bold=any(v > 8.0 for v in ku_vals))
@@ -2363,7 +2391,7 @@ class HarmonicsApp:
             row_cells[0].text = label
             fmt_cell(row_cells[0])
             for i, val in enumerate(vals):
-                row_cells[i+1].text = f"{val:.3f}"
+                row_cells[i+1].text = self._fmt(val,3)
                 fmt_cell(row_cells[i+1])
             avg_val = np.mean(vals)
             row_cells[-1].text = f"{avg_val:.3f}"
@@ -2644,7 +2672,7 @@ class HarmonicsApp:
                 cell.font = font
                 cell.alignment = alignment
                 if isinstance(value, float):
-                    cell.number_format = '0.00'
+                    cell.number_format = '# ##0.00'
 
     def _write_excel_row(self, ws, row, values, font, alignment):
         for c, val in enumerate(values, 1):
@@ -2652,7 +2680,7 @@ class HarmonicsApp:
             cell.font = font
             cell.alignment = alignment
             if isinstance(val, float):
-                cell.number_format = '0.00'
+                cell.number_format = '# ##0.00'
 
     def generate_extended_current_excel(self, data):
         channels = data['channels']
@@ -2764,7 +2792,7 @@ class HarmonicsApp:
             ["Ср. RMS пер., В", s_v['avg_rms_period']]
         ]
         for r, (label, val) in enumerate(volt_data, 2):
-            self._write_excel_row(ws_volt, r, [label, f"{val:.2f}"], font_main, align_center)
+            self._write_excel_row(ws_volt, r, [label, self._fmt(val, 2)], font_main, align_center)
 
         # ---------- Лист «Гармоники напряжения» ----------
         ws_harm_v = wb.create_sheet("Гармоники напряжения")
@@ -2849,7 +2877,7 @@ class HarmonicsApp:
             ["Среднее RMS за период, А", s_i['avg_rms_period']]
         ]
         for r, (label, val) in enumerate(current_data, 2):
-            self._write_excel_row(ws_param_i, r, [label, f"{val:.2f}"], font_main, align_center)
+            self._write_excel_row(ws_param_i, r, [label, self._fmt(val, 2)], font_main, align_center)
 
         # ---------- Лист «Гармоники тока» ----------
         ws_harm_i = wb.create_sheet("Гармоники тока")
@@ -2880,7 +2908,7 @@ class HarmonicsApp:
             ["THDi, %", i['thdi']],
         ]
         for r, (label, val) in enumerate(pow_rows, 2):
-            self._write_excel_row(ws_pow, r, [label, f"{val:.2f}" if isinstance(val, float) else val],
+            self._write_excel_row(ws_pow, r, [label, self._fmt(val, 2) if isinstance(val, float) else val],
                                   font_main, align_center)
 
         # Сохранение
@@ -3037,7 +3065,7 @@ class HarmonicsApp:
                     val = ph['current']['thdi']
                 else:
                     val = ph['power'][key]
-                r.append(f"{val:.2f}" if isinstance(val, float) else str(val))
+                r.append(self._fmt(val, 2) if isinstance(val, float) else str(val))
                 if key in ('P_total', 'Q_total', 'S_total'):
                     total += val
                 else:
@@ -3674,7 +3702,7 @@ class HarmonicsApp:
 
         if not long_analysis and len(rms_vals) <= 20:
             for t, val in zip(times, rms_vals):
-                ax.text(t, val + 0.03 * y_range, f"{val:.2f}", ha='center', fontsize=6)
+                ax.text(t, val + 0.03 * y_range, self._fmt(val, 2), ha='center', fontsize=6)
         else:
             min_v, max_v, mean_v = y_min, y_max, np.mean(rms_vals)
             stats_text = f"min: {min_v:.2f} А\nmax: {max_v:.2f} А\nmean: {mean_v:.2f} А"
@@ -4814,7 +4842,7 @@ class HarmonicsApp:
                 cell.font = font
                 cell.alignment = align
                 if isinstance(value, float):
-                    cell.number_format = '0.00'
+                    cell.number_format = '# ##0.00'
 
     def save_plot_image(self, filename):
         if not self.have_plots:
@@ -4847,7 +4875,7 @@ class HarmonicsApp:
         for bar, val in zip(bars, vals):
             height = bar.get_height()
             self.ax2.text(bar.get_x() + bar.get_width()/2., height,
-                          f'{val:.2f}', ha='center', va='bottom', fontsize=8, rotation=90)
+                          self._fmt(val), ha='center', va='bottom', fontsize=8, rotation=90)
         self.canvas.draw()
 
     def plot_combined(self, v_harm, i_harm):
