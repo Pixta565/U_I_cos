@@ -469,7 +469,7 @@ class HarmonicsApp:
         ttk.Button(btn_frame, text="Предпросмотр", command=self.preview_signal).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Настройки", command=self.open_settings).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Запуск", style='Start.TButton', command=self.start_analysis).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(btn_frame, text="Стоп", command=self.stop_analysis).pack(side=tk.RIGHT, padx=2)
+        #ttk.Button(btn_frame, text="Стоп", command=self.stop_analysis).pack(side=tk.RIGHT, padx=2)
 
         self.progress = ttk.Progressbar(parent, mode='determinate', maximum=100)
         self.progress.pack(fill=tk.X, pady=5)
@@ -782,8 +782,7 @@ class HarmonicsApp:
             self.result_queue.put(("error", str(e)))
         except StopIteration:
             self.result_queue.put(("log", "Анализ остановлен."))
-        finally:
-            self.result_queue.put(("done", None))
+        
 
     def analyze_single(self, mode, path):
         t0, tInc, ch_names, data = parse_csv(path)
@@ -1179,77 +1178,78 @@ class HarmonicsApp:
 
     # -------------------- Обработчики расширенного отчёта по напряжению --------------------
     def handle_extended_voltage_results(self, data):
-        phases = data['phases']
-        long_analysis = data['long_analysis']
-        tInc = data['tInc']
-        ch_names = data['ch_names']
-        assignments = data['assignments']
-
-        # Логирование
         self.log("=== Расширенный анализ напряжения ===")
-        for ph in phases:
+        for ph in data['phases']:
             self.log(f"Фаза {ph['name']}: f0={ph['f0']:.3f} Гц, U={ph['stats']['Urms']:.2f} В, THD={ph['thd']:.2f}%")
+        # Запускаем генерацию отчётов в фоновом потоке
+        t = threading.Thread(target=self._generate_voltage_reports, args=(data,), daemon=True)
+        t.start()
 
-        # Генерация Word, Excel, графиков
+    def _generate_voltage_reports(self, data):
         if HAVE_MPL:
-                    self.generate_extended_voltage_plots(data)
+            self.generate_extended_voltage_plots(data)
         if HAVE_DOCX:
             self.generate_extended_voltage_word(data)
         if HAVE_OPENPYXL:
             self.generate_extended_voltage_excel(data)
-        
-
-        # Также можно оставить текстовый отчёт в логах
-        # Сохраним общий текстовый файл
+        # Текстовый отчёт (можно оставить здесь же)
         report = self.build_text_report(data)
-        self.log(report)
+        self.result_queue.put(("log", report))
         self.save_text_report(report, "Отчет_напряжение.txt")
+        self.result_queue.put(("done", None))
 
     def handle_extended_current_results(self, data):
-        channels = data['channels']
-        long_analysis = data['long_analysis']
-        tInc = data['tInc']
-
         self.log("=== Расширенный анализ тока ===")
-        for ch in channels:
+        for ch in data['channels']:
             self.log(f"Канал {ch['name']}: f0={ch['f0']:.3f} Гц, Irms={ch['stats']['Irms']:.2f} А, THDi={ch['thdi']:.2f}%")
+        t = threading.Thread(target=self._generate_current_reports, args=(data,), daemon=True)
+        t.start()
 
+    def _generate_current_reports(self, data):
         if HAVE_MPL:
             self.generate_extended_current_plots(data)
         if HAVE_DOCX:
             self.generate_extended_current_word(data)
         if HAVE_OPENPYXL:
             self.generate_extended_current_excel(data)
+        self.result_queue.put(("done", None))
 
     def handle_extended_combined_results(self, data):
         self.log("=== Расширенный анализ (напряжение + ток) ===")
-        # Логирование основных параметров
         v = data['voltage']
         i = data['current']
         p = data['power']
         self.log(f"U: f0={v['f0']:.3f} Гц, Urms={v['stats']['Urms']:.2f} В, THD={v['thd']:.2f}%")
         self.log(f"I: Irms={i['stats']['Irms']:.3f} А, THDi={i['thdi']:.2f}%")
         self.log(f"P={p['P_total']:.2f} Вт, Q={p['Q_total']:.2f} вар, S={p['S_total']:.2f} ВА, PF={p['pf']:.3f}")
+        t = threading.Thread(target=self._generate_combined_reports, args=(data,), daemon=True)
+        t.start()
 
+    def _generate_combined_reports(self, data):
         if HAVE_MPL:
             self.generate_extended_combined_plots(data)
         if HAVE_DOCX:
             self.generate_extended_combined_word(data)
         if HAVE_OPENPYXL:
             self.generate_extended_combined_excel(data)
+        self.result_queue.put(("done", None))
 
     def handle_extended_three_phase_results(self, data):
         self.log("=== Расширенный трёхфазный анализ ===")
         for ph in data['phases']:
             self.log(f"Фаза {ph['name']}: U={ph['voltage']['stats']['Urms']:.2f} В, I={ph['current']['stats']['Irms']:.2f} А, P={ph['power']['P_total']:.2f} Вт")
         self.log(f"Суммарная мощность: P={data['total_power']['P_total']:.2f} Вт, Q={data['total_power']['Q_total']:.2f} вар, S={data['total_power']['S_total']:.2f} ВА, PF={data['total_power']['pf']:.3f}")
+        t = threading.Thread(target=self._generate_three_phase_reports, args=(data,), daemon=True)
+        t.start()
 
+    def _generate_three_phase_reports(self, data):
         if HAVE_MPL:
             self.generate_extended_three_phase_plots(data)
         if HAVE_DOCX:
             self.generate_extended_three_phase_word(data)
         if HAVE_OPENPYXL:
             self.generate_extended_three_phase_excel(data)
+        self.result_queue.put(("done", None))
 
     def build_text_report(self, data):
         phases = data['phases']
@@ -3079,58 +3079,43 @@ class HarmonicsApp:
     def generate_extended_combined_plots(self, data):
         total_plots = 8
         current_plot = 0
-        if self.stop_event.is_set():
-            return
         
         self._plot_power_factor_harmonics(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
-        
         self._plot_power_pie(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
+
         
         self._plot_ui_relative_amplitudes(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_ui_signal(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
-        
+
         self._plot_spectrum(data['voltage']['signal'], data['tInc'],
                             "Спектр_напряжения.png", "Спектр напряжения")
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
+
         
         self._plot_spectrum(data['current']['signal'], data['tInc'],
                             "Спектр_тока.png", "Спектр тока")
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_vector_diagram(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
+
         
         self._plot_combined_ui_overview(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
+
         
     def _plot_power_factor_harmonics(self, data):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -3357,8 +3342,7 @@ class HarmonicsApp:
         total_plots += len(phases)          # Сигнал
         total_plots += len(phases)          # Общий анализ
         current_plot = 0
-        if self.stop_event.is_set():
-            return
+
         # 1. Сравнение относительных амплитуд гармоник по фазам
         self._plot_relative_harmonics_comparison(phases)
         current_plot += 1
@@ -3366,8 +3350,6 @@ class HarmonicsApp:
 
         # 2. RMS по периодам для каждой фазы
         for ph in phases:
-            if self.stop_event.is_set():
-                return
             self._plot_rms_periods(ph)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
@@ -3375,8 +3357,6 @@ class HarmonicsApp:
         
         # 3. Гармоники 1-40 с ГОСТ для каждой фазы
         for ph in phases:
-            if self.stop_event.is_set():
-                return
             self._plot_harmonics_with_gost(ph, start_harm=1, end_harm=40)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
@@ -3384,8 +3364,6 @@ class HarmonicsApp:
         
         # 4. Гармоники 2-40 с ГОСТ для каждой фазы
         for ph in phases:
-            if self.stop_event.is_set():
-                return
             self._plot_harmonics_with_gost(ph, start_harm=2, end_harm=40)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
@@ -3393,8 +3371,6 @@ class HarmonicsApp:
         
         # 5. Амплитудный спектр для каждой фазы
         for ph in phases:
-            if self.stop_event.is_set():
-                return
             self._plot_spectrum(ph['signal'], ph['tInc'],
                                 f"Амплитудный_спектр_фаза_{ph['name']}.png",
                                 f"Амплитудный спектр фазы {ph['name']}")
@@ -3404,8 +3380,6 @@ class HarmonicsApp:
         
         # 6. Сигнал для каждой фазы
         for ph in phases:
-            if self.stop_event.is_set():
-                return
             self._plot_signal(ph)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
@@ -3413,8 +3387,6 @@ class HarmonicsApp:
         
         # 7. Общий анализ для каждой фазы
         for ph in phases:
-            if self.stop_event.is_set():
-                return
             self._plot_combined_analysis(ph)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
@@ -3640,48 +3612,32 @@ class HarmonicsApp:
         long_analysis = data['long_analysis']
         total_plots = len(channels) * 7   # 7 графиков на каждый канал
         current_plot = 0
-        if self.stop_event.is_set():
-            return
 
         for ch in channels:
-            if self.stop_event.is_set():
-                return
             self._plot_current_rms_periods(ch, long_analysis)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-            if self.stop_event.is_set():
-                return
             self._plot_current_signal(ch)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-            if self.stop_event.is_set():
-                return
             self._plot_current_harmonics(ch, 1, 40)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-            if self.stop_event.is_set():
-                return
             self._plot_current_harmonics(ch, 2, 40)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-            if self.stop_event.is_set():
-                return
             self._plot_current_thdi_pie(ch)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-            if self.stop_event.is_set():
-                return
             self._plot_current_spectrum(ch)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
 
-            if self.stop_event.is_set():
-                return
             self._plot_current_combined(ch)
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
@@ -3878,58 +3834,40 @@ class HarmonicsApp:
     def generate_extended_combined_plots(self, data):
         total_plots = 8
         current_plot = 0
-        if self.stop_event.is_set():
-            return
         
         self._plot_power_factor_harmonics(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_power_pie(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_ui_relative_amplitudes(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_ui_signal(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_spectrum(data['voltage']['signal'], data['tInc'],
                             "Спектр_напряжения.png", "Спектр напряжения")
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_spectrum(data['current']['signal'], data['tInc'],
                             "Спектр_тока.png", "Спектр тока")
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_vector_diagram(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         self._plot_combined_ui_overview(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
     def _plot_power_factor_harmonics(self, data):
         fig = Figure(figsize=(14, 8), dpi=300)
@@ -4140,53 +4078,39 @@ class HarmonicsApp:
         phases = data['phases']
         total_plots = 23
         current_plot = 0
-        if self.stop_event.is_set():
-            return
         
         # 1. Коэффициент мощности по гармоникам для каждой фазы
         for ph in phases:
             self._plot_phase_power_factor(ph, f"фаза_{ph['name']}")
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         # 2. Общий коэффициент мощности по гармоникам
         self._plot_total_power_factor(phases)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         # 3. Круговые диаграммы мощности для каждой фазы
         for ph in phases:
             self._plot_phase_power_pie(ph, f"фаза_{ph['name']}")
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         # 4. Общая круговая диаграмма мощности
         self._plot_total_power_pie(data)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         # 5. Относительные амплитуды U и I (все три фазы на одном графике)
         self._plot_three_phase_relative_amplitudes(phases)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         # 6. Напряжение и ток каждой фазы (синусоиды)
         for ph in phases:
             self._plot_phase_voltage_current(ph, f"фаза_{ph['name']}")
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         # 7. Спектры U и I для каждой фазы (без 1-й гармоники)
         for ph in phases:
@@ -4201,30 +4125,23 @@ class HarmonicsApp:
                                     f"Спектр тока фазы {ph['name']}")
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         # 8. Общая векторная диаграмма (три фазы на одном рисунке)
         self._plot_three_phase_vector(phases)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
         
         # 9. Общий анализ для каждой фазы (5 фото на одном)
         for ph in phases:
             self._plot_phase_combined(ph, f"фаза_{ph['name']}")
             current_plot += 1
             self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
-        
+
         # 10. Общий анализ всех трёх фаз (5 графиков на одном фото)
         self._plot_three_phase_total_combined(phases)
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
-        if self.stop_event.is_set():
-            return
+
         
     # ------------------- Вспомогательные методы для трёхфазных графиков -------------------
     def _plot_phase_power_factor(self, ph, suffix):
