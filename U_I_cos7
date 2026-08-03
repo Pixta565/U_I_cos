@@ -354,6 +354,7 @@ class HarmonicsApp:
             'rms_tolerance': 3.0
         }
         self.auto_scale_current = None   # будет хранить список или None
+        self.stop_event = threading.Event()
 
         self.csv_file_paths = [tk.StringVar() for _ in range(3)]
         self.channel_vars = []
@@ -468,10 +469,14 @@ class HarmonicsApp:
         ttk.Button(btn_frame, text="Предпросмотр", command=self.preview_signal).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Настройки", command=self.open_settings).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Запуск", style='Start.TButton', command=self.start_analysis).pack(side=tk.RIGHT, padx=2)
+        #ttk.Button(btn_frame, text="Стоп", command=self.stop_analysis).pack(side=tk.RIGHT, padx=2)
 
         self.progress = ttk.Progressbar(parent, mode='determinate', maximum=100)
         self.progress.pack(fill=tk.X, pady=5)
 
+    def stop_analysis(self):
+        self.stop_event.set()
+        self.log("Запрошена остановка анализа...")
 
     def update_file_visibility(self):
         mode = self.mode_var.get()
@@ -643,7 +648,6 @@ class HarmonicsApp:
         preview_win.focus_set()
 
     def _ask_current_value(self, default_val, prompt):
-        """Маленькое диалоговое окно для ввода известного тока."""
         dialog = tk.Toplevel(self.root)
         dialog.title("Калибровка тока")
         dialog.transient(self.root)
@@ -654,7 +658,7 @@ class HarmonicsApp:
         entry.pack(padx=10, pady=5)
         entry.select_range(0, tk.END)
         entry.focus_set()
-        result = [None]  # список, чтобы сохранить результат из замыкания
+        result = [None]
 
         def on_ok():
             try:
@@ -669,21 +673,37 @@ class HarmonicsApp:
 
         ttk.Button(dialog, text="ОК", command=on_ok).pack(side=tk.LEFT, padx=10, pady=10)
         ttk.Button(dialog, text="Отмена", command=dialog.destroy).pack(side=tk.RIGHT, padx=10, pady=10)
+
+        # === Центрируем диалог относительно главного окна ===
+        dialog.update_idletasks()  # чтобы размеры диалога определились
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        dlg_w = dialog.winfo_reqwidth()
+        dlg_h = dialog.winfo_reqheight()
+        x = root_x + (root_w - dlg_w) // 2
+        y = root_y + (root_h - dlg_h) // 2
+        dialog.geometry(f"+{x}+{y}")
+
         self.root.wait_window(dialog)
         return result[0]
 
     def _auto_scale_current_dialog(self, mode, paths):
-        """Запрашивает целевой ток для каждой фазы и рассчитывает масштаб.
-        Возвращает True, если можно продолжать анализ, False при отмене."""
         assignments = [var.get() for var in self.channel_vars]
-        
-        if "Трёхфазный" in mode:                     # Трёхфазный объединённый (3 файла)
+        self.root.update_idletasks()   # обрабатываем события перед диалогом
+
+        if "Трёхфазный" in mode:
             scales = []
             for idx, path in enumerate(paths):
-                _, _, ch_names, data = parse_csv(path)
-                # Ищем индекс канала, назначенного как "Ток"
-                ток_idx = next((i for i, a in enumerate(assignments) if a == "Ток"), None)
-                if ток_idx is None:                  # если ток не назначен, масштаб = 1
+                try:
+                    _, _, ch_names, data = parse_csv(path)
+                except Exception as e:
+                    messagebox.showerror("Ошибка чтения CSV", f"Фаза {chr(ord('А')+idx)}: {e}")
+                    return False
+                try:
+                    ток_idx = next(i for i, a in enumerate(assignments) if a == "Ток")
+                except StopIteration:
                     scales.append(1.0)
                     continue
                 raw_rms = np.sqrt(np.mean(data[:, ток_idx]**2))
@@ -691,35 +711,37 @@ class HarmonicsApp:
                     raw_rms,
                     f"Действующее значение тока фазы {chr(ord('А')+idx)} (А):"
                 )
-                if target is None:                   # пользователь нажал «Отмена»
-                    return False
-                scales.append(target / raw_rms if raw_rms != 0 else 1.0)
-            self.auto_scale_current = scales
-            return True
-
-        else:                                         # однофайловые режимы
-            path = paths[0]
-            _, _, ch_names, data = parse_csv(path)
-            tok_kann = [(i, ch_names[i]) for i, a in enumerate(assignments) if a == "Ток"]
-            if not tok_kann:
-                return True
-            scales = []
-            for idx, name in tok_kann:
-                raw_rms = np.sqrt(np.mean(data[:, idx]**2))
-                target = self._ask_current_value(
-                    raw_rms,
-                    f"Ток канала {name} (А):"
-                )
                 if target is None:
                     return False
                 scales.append(target / raw_rms if raw_rms != 0 else 1.0)
             self.auto_scale_current = scales
             return True
 
+        # однофайловые режимы
+        path = paths[0]
+        try:
+            _, _, ch_names, data = parse_csv(path)
+        except Exception as e:
+            messagebox.showerror("Ошибка чтения CSV", str(e))
+            return False
+        tok_kann = [(i, ch_names[i]) for i, a in enumerate(assignments) if a == "Ток"]
+        if not tok_kann:
+            return True
+        scales = []
+        for idx, name in tok_kann:
+            raw_rms = np.sqrt(np.mean(data[:, idx]**2))
+            target = self._ask_current_value(raw_rms, f"Ток канала {name} (А):")
+            if target is None:
+                return False
+            scales.append(target / raw_rms if raw_rms != 0 else 1.0)
+        self.auto_scale_current = scales
+        return True
+
     def start_analysis(self):
         self.progress['mode'] = 'determinate'
         self.progress['maximum'] = 100
         self.progress['value'] = 0 
+        self.stop_event.clear()
         mode = self.mode_var.get()
         if "Трёхфазный" in mode:
             paths = [self.csv_file_paths[i].get() for i in range(3)]
@@ -756,6 +778,8 @@ class HarmonicsApp:
                 self.analyze_single(mode, paths[0])
         except Exception as e:
             self.result_queue.put(("error", str(e)))
+        except StopIteration:
+            self.result_queue.put(("log", "Анализ остановлен."))
         finally:
             self.result_queue.put(("done", None))
 
@@ -3071,12 +3095,12 @@ class HarmonicsApp:
         self.result_queue.put(("progress", current_plot / total_plots * 100))
 
         self._plot_spectrum(data['voltage']['signal'], data['tInc'],
-                            "spectrum_U.png", "Спектр напряжения")
+                            "Спектр_напряжения.png", "Спектр напряжения")
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
 
         self._plot_spectrum(data['current']['signal'], data['tInc'],
-                            "spectrum_I.png", "Спектр тока")
+                            "Спектр_тока.png", "Спектр тока")
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
 
@@ -3817,12 +3841,12 @@ class HarmonicsApp:
         self.result_queue.put(("progress", current_plot / total_plots * 100))
 
         self._plot_spectrum(data['voltage']['signal'], data['tInc'],
-                            "spectrum_U.png", "Спектр напряжения")
+                            "Спектр_напряжения.png", "Спектр напряжения")
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
 
         self._plot_spectrum(data['current']['signal'], data['tInc'],
-                            "spectrum_I.png", "Спектр тока")
+                            "Спектр_тока.png", "Спектр тока")
         current_plot += 1
         self.result_queue.put(("progress", current_plot / total_plots * 100))
 
