@@ -808,7 +808,7 @@ class HarmonicsApp:
                 raw_rms = np.sqrt(np.mean(signal_ac**2))
                 target = self._ask_current_value(
                     raw_rms,
-                    f"Действующее значение тока фазы {chr(ord('А')+idx)} (А):"
+                    f"Действующее значение тока фазы {chr(ord('A')+idx)} (А):"
                 )
                 if target is None:                   # пользователь нажал «Отмена»
                     return False
@@ -912,8 +912,7 @@ class HarmonicsApp:
         try:
             if "Трёхфазный" in mode:
                 # Извлекаем tInc из первого файла
-                _, tInc, _, _ = parse_csv(paths[0])
-                self.analyze_three_phase_extended(paths, tInc)
+                self.analyze_three_phase_extended(paths)
             else:
                 self.analyze_single(mode, paths[0])
         except Exception as e:
@@ -1136,16 +1135,41 @@ class HarmonicsApp:
         }
         self.result_queue.put(("combined_results_extended", data))
 
-    def analyze_three_phase_extended(self, paths, tInc):
+    def analyze_three_phase_extended(self, paths, tInc=None):
+        # tInc больше не используется извне, будем брать из каждого файла
         long_analysis = self.long_analysis_var.get()
         assignments = [var.get() for var in self.channel_vars]
         phases_data = []
         total_power = {'P_total': 0.0, 'Q_total': 0.0, 'S_total': 0.0, 'pf': 0.0}
-        phase_names = ['А', 'В', 'С']
+        phase_names = ['A', 'B', 'C']
 
+        # ---------- Шаг 1: Определяем общую частоту сети ----------
+        f0_list = []
+        for idx, path in enumerate(paths):
+            try:
+                _, tInc_file, ch_names, data = parse_csv(path)
+            except Exception:
+                continue
+            v_sig_temp = None
+            for i, assign in enumerate(assignments):
+                if i >= data.shape[1]:
+                    continue
+                if assign == "Напряжение":
+                    v_sig_temp = data[:, i] * self.settings['scale_voltage']
+                    break
+            if v_sig_temp is not None:
+                f0_est = estimate_frequency(v_sig_temp, tInc_file, nominal=50.0)
+                f0_list.append(f0_est)
+
+        if f0_list:
+            f0_common = np.mean(f0_list)
+        else:
+            f0_common = 50.0
+
+        # ---------- Шаг 2: Анализ каждой фазы со своим tInc ----------
         for idx, path in enumerate(paths):
             self.result_queue.put(("log", f"Обработка фазы {phase_names[idx]}"))
-            _, _, ch_names, data = parse_csv(path)
+            _, tInc, ch_names, data = parse_csv(path)   # tInc свой для каждой фазы
             v_sig = None
             i_sig = None
             for i, assign in enumerate(assignments):
@@ -1154,17 +1178,17 @@ class HarmonicsApp:
                 if assign == "Напряжение":
                     v_sig = data[:, i] * self.settings['scale_voltage']
                 elif assign == "Ток":
-                    # Определяем масштаб для текущей фазы
+                    scale = self.settings['scale_current']
                     if self.auto_scale_current is not None and idx < len(self.auto_scale_current):
                         scale = self.auto_scale_current[idx]
-                    else:
-                        scale = self.settings['scale_current']
                     i_sig = data[:, i] * scale
             if v_sig is None or i_sig is None:
                 raise ValueError(f"Фаза {phase_names[idx]}: не назначены напряжение и ток")
 
             i_sig_ac = i_sig - np.mean(i_sig)
-            f0 = estimate_frequency(v_sig, tInc)
+
+            # Используем общую частоту, но с корректным tInc этой фазы
+            f0 = f0_common
 
             # Напряжение
             v_stats = compute_signal_stats(v_sig, tInc, f0, self.settings['nominal_voltage'], self.settings['rms_tolerance'])
@@ -1251,8 +1275,9 @@ class HarmonicsApp:
             'phases': phases_data,
             'total_power': total_power,
             'long_analysis': long_analysis,
-            'tInc': tInc
+            'tInc': tInc   # можно и так, но нигде не используется
         }))
+
     def process_signal(self, signal, tInc, sig_type):
         f0 = estimate_frequency(signal, tInc)
         harmonics = get_harmonic_amplitudes(signal, tInc, f0)
@@ -4844,26 +4869,21 @@ class HarmonicsApp:
     def _plot_three_phase_total_combined(self, phases):
         fig = Figure(figsize=(24, 14), dpi=300)
         gs = fig.add_gridspec(2, 3)
-        
+
         # 1. Напряжения трёх фаз
         ax1 = fig.add_subplot(gs[0, 0])
-        # Вычисляем основную частоту (можно усреднить по фазам)
         f0 = np.mean([ph['voltage']['f0'] for ph in phases])
-        # Период основной частоты
-        T0 = 1.0 / f0
-        # Временные сдвиги для фаз B и C (в секундах)
+        T0 = 1.0 / f0 if f0 != 0 else 0.02
         time_shifts = {
-            'А': 0.0,
-            'В': T0 / 3,      # 120°
-            'С': 2 * T0 / 3   # 240°
+            'A': 0.0,
+            'B': T0 / 3,
+            'C': 2 * T0 / 3
         }
-
         for ph in phases:
-            # Временной массив для данной фазы со сдвигом
-            t_shifted = np.arange(len(ph['voltage']['signal'])) * ph['voltage']['tInc'] + time_shifts[ph['name']]
+            t_shifted = np.arange(len(ph['voltage']['signal'])) * ph['voltage']['tInc'] + time_shifts.get(ph['name'], 0)
             ax1.plot(t_shifted, ph['voltage']['signal'], label=f"U {ph['name']}")
         ax1.set_title("Напряжения трёх фаз")
-        ax1.legend()
+        ax1.legend(loc='upper right')
         ax1.grid(True)
 
         # 2. Средний коэффициент мощности по гармоникам
@@ -4909,11 +4929,9 @@ class HarmonicsApp:
         ax5 = fig.add_subplot(gs[1, 1])
         self._mini_relative_amplitudes(ax5, phases)
 
-        # Удаляем лишний subplot
-        fig.delaxes(fig.add_subplot(gs[1, 2]))
+        # Пустая ячейка gs[1, 2] остаётся — так задумано.
         fig.tight_layout()
         self._save_figure(fig, "Общий_анализ_всех_фаз.png")
-        
 
     def _mini_three_phase_vector(self, ax, phases):
         colors = ['red', 'green', 'blue']
